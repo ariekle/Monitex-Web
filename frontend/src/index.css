@@ -1,0 +1,28 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  @apply font-ui text-slate-800;
+  margin: 0;
+}
+
+/* Classic Win32 raised-button look, used on Account.tsx to echo the original VB6 form. */
+.win-button {
+  @apply border border-slate-500 bg-[#DCDAD3] px-5 py-2.5 text-[19px] text-slate-800;
+  box-shadow:
+    inset 1px 1px 0 rgba(255, 255, 255, 0.8),
+    inset -1px -1px 0 rgba(0, 0, 0, 0.25);
+}
+.win-button:hover:not(:disabled) {
+  @apply bg-[#E5E3DC];
+}
+.win-button:active:not(:disabled) {
+  box-shadow:
+    inset -1px -1px 0 rgba(255, 255, 255, 0.8),
+    inset 1px 1px 0 rgba(0, 0, 0, 0.25);
+}

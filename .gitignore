@@ -1,0 +1,20 @@
+# Frontend
+frontend/node_modules
+frontend/dist
+
+# Backend
+backend/__pycache__/
+backend/**/__pycache__/
+backend/*.pyc
+backend/.venv/
+
+# Secrets — never commit real DB credentials
+backend/.env
+
+# Per-workstation local file, superseded by client-supplied branch_area
+# (see api/branch.ts) — not part of the app itself
+frontend/meesql.cfg
+
+# OS/editor cruft
+.DS_Store
+**/.DS_Store
