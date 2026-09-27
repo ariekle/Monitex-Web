@@ -93,16 +93,23 @@ from ..models import Account, History, Meter
 from ..schemas import (
     AccPaidCheckIn,
     AccPaidCheckOut,
+    ExpiryActionOut,
+    ExpiryReduceIn,
+    ExpiryTransferIn,
+    ExpiryTransferOut,
     MeterActionCheckIn,
     MeterActionCheckOut,
     MeterActionSaveIn,
     MeterActionSaveOut,
     MeterNrCheckIn,
     MeterNrCheckOut,
+    ModemActionIn,
+    ModemActionOut,
     ReplaceMeterIn,
     ReplaceMeterOut,
     ResetPoolOut,
 )
+from .invoices import _advance_exp_date, _is_expired, _reduce_exp_date
 
 router = APIRouter(tags=["meter-actions"])
 
@@ -182,6 +189,18 @@ def _parse_ddmmyyyy(s: Optional[str]) -> Optional[date]:
         return datetime.strptime(s.strip(), "%d/%m/%Y").date()
     except ValueError:
         return None
+
+
+def _left_months(exp_date: int) -> int:
+    """
+    Ported from leftMonths() in Code VB6/frmChangeExp.frm — whole months
+    remaining between today and exp_date (month*10000+year encoding).
+    """
+    today = date.today()
+    exp_month, exp_year = exp_date // 10000, exp_date % 10000
+    if exp_month > today.month:
+        return (exp_year - 1 - today.year) * 12 + exp_month + 12 - today.month
+    return (exp_year - today.year) * 12 + exp_month - today.month
 
 
 def _credit_service_stolen(meter: Meter) -> int:
@@ -596,3 +615,196 @@ def reset_pool_balances(taxi_nr: int, db: Session = Depends(get_db)):
     account.PaidCovas = 0
     db.commit()
     return ResetPoolOut(ok=True)
+
+
+@router.post("/{taxi_nr}/modem-action", response_model=ModemActionOut)
+def modem_action(taxi_nr: int, payload: ModemActionIn, db: Session = Depends(get_db)):
+    """
+    Web equivalent of cmdModem_Click -> lstModemActions_DblClick in
+    Account.frm. Only 2 of the menu's original 3 slots are live — the
+    DEPOSIT branch (`Case 0` reassigned to a commented-out block) and the
+    STOLEN branch (`Case 2`, also commented out) are dead code in the
+    original, so this only exposes action=0 (install/activate) and action=1
+    (remove). Uses Account.Modem, which reuses the SAME 1/2/3/4 status codes
+    as Meter.Status (see METER_ACTIVE etc. above and the Account model
+    docstring). Writes a History row matching the field set of the
+    original's own SaveHistory() helper (status 81=install, 82=remove — not
+    confirmed against a real Actions row, best-guess labels like the other
+    not-yet-confirmed statuses in this file).
+
+    lstModemActions' exact button captions live in Account.frx (a legacy
+    binary resource this port can't read) — the frontend menu labels are
+    freshly authored, not transcribed.
+    """
+    if payload.action not in (0, 1):
+        raise HTTPException(status_code=422, detail="Unknown modem action")
+
+    account = _get_account_or_404(db, taxi_nr)
+    meter = _get_current_meter(db, account)
+
+    if payload.action == 0:
+        if account.Modem == METER_ACTIVE:
+            raise HTTPException(status_code=409, detail="!!!מודם כבר מותקן במונית")
+        account.Modem = METER_ACTIVE
+        status = 81
+    else:
+        if account.Modem != METER_ACTIVE:
+            raise HTTPException(status_code=409, detail="!!!מודם לא מותקן במונית")
+        account.Modem = METER_REMOVED
+        status = 82
+
+    db.flush()
+
+    now = datetime.now()
+    db.add(
+        History(
+            TaxiNr=account.TaxiNr,
+            Name=f"{(account.FamilyName or '').strip()} {(account.PrivatName or '').strip()}".strip(),
+            MeterNr=account.MeterNr,
+            CarNr=account.CarNr,
+            ExpDate=meter.ExpDate if meter else None,
+            Insurance=meter.Insurance if meter else None,
+            Status=status,
+            Date=now.date(),
+            Time=now.time(),
+            Area=payload.branch_area,
+        )
+    )
+    db.commit()
+    db.refresh(account)
+
+    return ModemActionOut(ok=True, modem=account.Modem)
+
+
+@router.post("/{taxi_nr}/expiry/reduce", response_model=ExpiryActionOut)
+def reduce_expiry(taxi_nr: int, payload: ExpiryReduceIn, db: Session = Depends(get_db)):
+    """
+    Web equivalent of frmChangeExp's txtReduceMonths path (cmdSave_Click's
+    `Val(txtReduceMonths) > 0` branch) — manually deducts N months of
+    service credit from THIS taxi's own meter (e.g. to correct an
+    over-credit), writing a History row (status=51, AccPaid=months).
+
+    Reached from "תוקף" (cmdExpDate_Click), which the original gates behind
+    frmPasswordEnter — not ported, same as every other password gate in this
+    app (see routers/reset.py's module docstring: no auth/login system
+    exists here yet, so nothing is more or less gated than any other
+    screen). The original's OTHER two guards on cmdExpDate_Click ARE
+    reproduced: no meter installed, and the meter already being expired (an
+    already-lapsed meter must be renewed through the normal service-payment
+    invoice flow, not this manual correction tool).
+    """
+    account = _get_account_or_404(db, taxi_nr)
+    meter = _get_current_meter(db, account)
+    if meter is None:
+        raise HTTPException(status_code=409, detail="!!!אין מונה מותקן במונית")
+    if _is_expired(meter.ExpDate):
+        raise HTTPException(status_code=409, detail="!!!תוקף המונה כבר פג")
+    if payload.months <= 0:
+        raise HTTPException(status_code=422, detail="יש להזין מספר חודשים חיובי")
+    if _left_months(meter.ExpDate) < payload.months:
+        raise HTTPException(status_code=409, detail="!!!אין מספיק חודשי תוקף להפחתה")
+
+    meter.ExpDate = _reduce_exp_date(meter.ExpDate, payload.months)
+    db.flush()
+
+    now = datetime.now()
+    db.add(
+        History(
+            TaxiNr=account.TaxiNr,
+            Name=f"{(account.PrivatName or '').strip()} {(account.FamilyName or '').strip()}".strip(),
+            MeterNr=account.MeterNr,
+            CarNr=account.CarNr,
+            Insurance=meter.Insurance,
+            ExpDate=meter.ExpDate,
+            Status=51,
+            AccPaid=payload.months,
+            Date=now.date(),
+            Time=now.time(),
+            Area=payload.branch_area,
+        )
+    )
+    db.commit()
+    db.refresh(meter)
+    return ExpiryActionOut(ok=True, expDate=meter.ExpDate)
+
+
+@router.post("/{taxi_nr}/expiry/transfer", response_model=ExpiryTransferOut)
+def transfer_expiry(taxi_nr: int, payload: ExpiryTransferIn, db: Session = Depends(get_db)):
+    """
+    Web equivalent of frmChangeExp's txtTransferMonths/txtTransferTaxiNr path
+    — moves N months of remaining service credit from THIS taxi's meter to
+    ANOTHER taxi's meter. Same guard-rails as reduce_expiry (meter installed,
+    not already expired, enough months left), plus the target taxi and its
+    meter must exist. Writes two History rows, matching the original exactly
+    (status=52 on the source taxi, status=53 on the target), each one
+    cross-referencing the OTHER taxi via History.InvoiceNr — a field reuse,
+    not an actual invoice, matching `HistoryRec.Recordset![invoiceNr] =
+    txtTransferTaxiNr` / `... = frmMain.AccountRec.Recordset![TaxiNr]` in the
+    original.
+    """
+    account = _get_account_or_404(db, taxi_nr)
+    meter = _get_current_meter(db, account)
+    if meter is None:
+        raise HTTPException(status_code=409, detail="!!!אין מונה מותקן במונית")
+    if _is_expired(meter.ExpDate):
+        raise HTTPException(status_code=409, detail="!!!תוקף המונה כבר פג")
+    if payload.months <= 0:
+        raise HTTPException(status_code=422, detail="יש להזין מספר חודשים חיובי")
+
+    target_account = db.get(Account, payload.target_taxi_nr)
+    if target_account is None:
+        raise HTTPException(status_code=404, detail="!לקוח לא נמצא")
+    target_meter = _get_current_meter(db, target_account)
+    if target_meter is None:
+        raise HTTPException(status_code=409, detail="!!!אין מונה מותקן במונית היעד")
+
+    if _left_months(meter.ExpDate) < payload.months:
+        raise HTTPException(status_code=409, detail="!!!אין מספיק חודשי תוקף להעברה")
+
+    meter.ExpDate = _reduce_exp_date(meter.ExpDate, payload.months)
+    target_meter.ExpDate = _advance_exp_date(target_meter.ExpDate, payload.months)
+    db.flush()
+
+    now = datetime.now()
+    source_name = f"{(account.PrivatName or '').strip()} {(account.FamilyName or '').strip()}".strip()
+    target_name = f"{(target_account.PrivatName or '').strip()} {(target_account.FamilyName or '').strip()}".strip()
+
+    db.add(
+        History(
+            TaxiNr=account.TaxiNr,
+            Name=source_name,
+            MeterNr=account.MeterNr,
+            CarNr=account.CarNr,
+            Insurance=meter.Insurance,
+            InvoiceNr=target_account.TaxiNr,
+            Status=52,
+            AccPaid=payload.months,
+            Date=now.date(),
+            Time=now.time(),
+            Area=payload.branch_area,
+        )
+    )
+    db.add(
+        History(
+            TaxiNr=target_account.TaxiNr,
+            Name=target_name,
+            MeterNr=target_account.MeterNr,
+            CarNr=target_account.CarNr,
+            Insurance=target_meter.Insurance,
+            InvoiceNr=account.TaxiNr,
+            Status=53,
+            AccPaid=payload.months,
+            Date=now.date(),
+            Time=now.time(),
+            Area=payload.branch_area,
+        )
+    )
+    db.commit()
+    db.refresh(meter)
+    db.refresh(target_meter)
+    return ExpiryTransferOut(
+        ok=True,
+        sourceExpDate=meter.ExpDate,
+        targetTaxiNr=target_account.TaxiNr,
+        targetExpDate=target_meter.ExpDate,
+    )

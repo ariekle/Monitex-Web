@@ -1,5 +1,12 @@
 import { useEffect, useState } from 'react'
-import { fetchAreas, getStoredBranchArea, setStoredBranchArea, type AreaOption } from '../api/branch'
+import {
+  fetchAreas,
+  getStoredBranchArea,
+  getStoredIsAccounting,
+  setStoredBranchArea,
+  setStoredIsAccounting,
+  type AreaOption,
+} from '../api/branch'
 
 /**
  * One-time-per-workstation branch picker — the web equivalent of setting up
@@ -8,18 +15,26 @@ import { fetchAreas, getStoredBranchArea, setStoredBranchArea, type AreaOption }
  * visit on this browser/computer skips straight through. Reopen via the
  * "שנה סניף" control this component renders once a value is set (e.g. if a
  * shared computer moves branches).
+ *
+ * Also collects the "isAccounting" flag here (only meaningful/shown when
+ * Area=0/Tel Aviv is selected) — see api/branch.ts's comment for why this is
+ * a separate explicit flag rather than reusing Area=0 alone.
  */
 export default function BranchAreaGate({ children }: { children: React.ReactNode }) {
   const [branchArea, setBranchArea] = useState<number | null>(() => getStoredBranchArea())
+  const [isAccounting, setIsAccounting] = useState<boolean>(() => getStoredIsAccounting())
   const [changing, setChanging] = useState(false)
 
   if (branchArea === null || changing) {
     return (
       <BranchAreaPicker
         current={branchArea}
-        onChosen={(area) => {
+        currentIsAccounting={isAccounting}
+        onChosen={(area, accounting) => {
           setStoredBranchArea(area)
+          setStoredIsAccounting(accounting)
           setBranchArea(area)
+          setIsAccounting(accounting)
           setChanging(false)
         }}
         onCancel={changing ? () => setChanging(false) : undefined}
@@ -44,16 +59,19 @@ export default function BranchAreaGate({ children }: { children: React.ReactNode
 
 function BranchAreaPicker({
   current,
+  currentIsAccounting,
   onChosen,
   onCancel,
 }: {
   current: number | null
-  onChosen: (area: number) => void
+  currentIsAccounting: boolean
+  onChosen: (area: number, isAccounting: boolean) => void
   onCancel?: () => void
 }) {
   const [areas, setAreas] = useState<AreaOption[] | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [selected, setSelected] = useState<number | null>(current)
+  const [accounting, setAccounting] = useState<boolean>(currentIsAccounting)
 
   useEffect(() => {
     fetchAreas()
@@ -87,6 +105,12 @@ function BranchAreaPicker({
             ))}
           </select>
         )}
+        {selected === 0 && (
+          <label className="flex items-center gap-2 text-[15px] text-slate-700">
+            <input type="checkbox" checked={accounting} onChange={(e) => setAccounting(e.target.checked)} />
+            מחשב הנהלת חשבונות (מציג את "העברה לחשבשבת")
+          </label>
+        )}
         <div className="flex justify-end gap-2">
           {onCancel && (
             <button type="button" onClick={onCancel} className="win-button">
@@ -96,7 +120,7 @@ function BranchAreaPicker({
           <button
             type="button"
             disabled={selected === null}
-            onClick={() => selected !== null && onChosen(selected)}
+            onClick={() => selected !== null && onChosen(selected, selected === 0 && accounting)}
             className="win-button disabled:opacity-50"
           >
             אישור

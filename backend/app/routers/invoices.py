@@ -17,9 +17,13 @@ Ported:
   types 2-5 each get their own independent Type*1,000,000 range.
 - VAT from the single CFG row (global rate, matches
   `VAT = cfgRec.Recordset![VAT]` in Account.frm).
-- Line items priced from PriceList (defaults to Price1 if no override given —
-  see PriceListItem docstring in models.py on the unconfirmed Price1..6/Area
-  mapping). PriceList prices are VAT-INCLUSIVE, matching totalInvoice() in
+- Line items priced from PriceList — defaults to the item's full combined
+  price (sum of Price1..Price6) if no override given, matching ActivateLine()
+  in frmInvRec.frm (confirmed 2026-08-19; Price1..6 are NOT per-Area/branch
+  variants — an item priced across more than one column is paid off in that
+  many separate payments, one per column, see InvoiceLineIn/create_invoice()'s
+  handling of payments and InvoiceModal.tsx's priceListInstallments()).
+  PriceList prices are VAT-INCLUSIVE, matching totalInvoice() in
   frmInvRec.frm: the line-item total is the gross/payable amount, and VAT is
   extracted out of it (net = gross*100/(100+VAT)), never added on top.
 - Payment capture, ported from frmInvRec.frm's PaymentType encoding:
@@ -87,8 +91,8 @@ Ported:
     - If the resulting extension would push ExpDate forward while the
       meter's current service hasn't actually expired yet, the original
       pops a confirm dialog ("ללקוח יש ביטוח בתוקף... לקדם תקופת ביטוח
-      בכל זאת?") — ported as a 409 the first time, resolved by resubmitting
-      with confirm_extend_service=True (see InvoiceCreate docstring).
+      בכל זאת?"), resolved by resubmitting with confirm_extend_service=True
+      (see InvoiceCreate docstring).
   When the ISSUING BRANCH's Area is Eilat(7), pricing/flagging uses
   PriceListEilat instead of PriceList — see PriceListEilat model docstring
   and _pricelist_model(). IMPORTANT: this is the BRANCH's Area (which
@@ -110,20 +114,57 @@ Ported:
   Eilat snapshot flag (set from whichever branch_area was sent at save
   time), so it stays correct regardless of what the current caller sends.
 
+- HESHBONIT_ISKA(3) "חש. עסקה" — billed to a DIFFERENT account than the one
+  issuing it. Ported from the `InvAction = 3` branches in SaveRec():
+  payload.paid_by_taxi_nr is looked up in Accounts (must exist), its name
+  becomes Invoices.namePaid, its TaxiNr becomes Invoices.AccPaid. The
+  invoice's own combined `Name` field is left blank for this type — matches
+  `If InvRec.Recordset![Type] <> HESHBONIT_ISKA Then name = ...` (i.e. name
+  is explicitly NOT set when it IS iska) — FamilyName/PrivateName/etc. are
+  still snapshotted from the issuing taxi's own account as usual.
+- CREDIT_NOTE(4) "חשבונית זיכוי" — references the original document being
+  credited via payload.credited_inv_nr, the RAW InvNr (not the display
+  number — display numbers aren't globally unique, only unique WITHIN one
+  type's series, so e.g. display number 1 can exist in both the
+  HESHBONIT_KABALA/HESHBONIT series and HESHBONIT_ISKA's own series at the
+  same time; only the full InvNr disambiguates) of one of THIS taxi's own
+  HESHBONIT_KABALA/HESHBONIT/HESHBONIT_ISKA documents, stored as-is on
+  Invoices.RecNr. The frontend already has this value whenever it's showing
+  a specific invoice, so the caller never needs to "type" it. Deviates from
+  the original in one way: frmInvoice.frm's txtRecNrCred took the raw typed
+  value directly as RecNr with NO existence check and no taxi-scoping at
+  all — here it's validated to actually exist, belong to this taxi, and be
+  a creditable type, 404ing otherwise (safer, and matches how every other
+  cross-reference in this app already works — see RecNr docstring on the
+  Invoice model).
+  A service-line (add_service) on a credit note REDUCES the meter's
+  ExpDate by the given month count instead of extending it — ported
+  verbatim from the `reduce_months`/`expDate - 10000` loop in SaveRec(),
+  see _reduce_exp_date(). The confirm-dialog gate (`Not Expired(...)`) is
+  the same as for a normal extension, but the ORIGINAL's actual behavior is
+  asymmetric: extension applies whenever the meter is expired OR the user
+  confirms, while reduction applies ONLY when the user explicitly confirms
+  (an already-expired meter's service is never shortened, silently no-op)
+  — reproduced exactly, not "fixed", since it may be intentional (no point
+  shortening something already lapsed).
+  Confirmed via SaveRec() that BOTH new types still trigger the meter/
+  insurance/service side-effects block (`Type = HESHBONIT_KABALA Or Type =
+  HESHBONIT Or Type = CREDIT_NOTE Or Type = HESHBONIT_ISKA`) — not just
+  HESHBONIT_KABALA/HESHBONIT as Phase 1 had it.
+
 NOT yet ported:
-- Types 3, 4, 5 issuing (חש. עסקה, ת. זיכוי, ת. משלוח) — each has its own
-  extra rules (iska paid-by-another-account, credit note original-doc
-  reference, etc.)
+- TEUDAT_MISHLOAH(5) "תעודת משלוח" issuing — out of scope per user request,
+  not needed.
 - Card-issuer/bank lookup for credit payments (see above)
 - Deletion (types 90-95 in the Actions table)
 """
 from datetime import date, datetime
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from sqlalchemy import func
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ..database import get_db
@@ -133,6 +174,7 @@ from ..models import (
     Action,
     Area,
     Cfg,
+    Check,
     Invoice,
     Meter,
     PriceListItem,
@@ -141,12 +183,15 @@ from ..models import (
     HESHBONIT_KABALA,
     HESHBONIT,
     KABALA,
+    HESHBONIT_ISKA,
+    CREDIT_NOTE,
 )
 from ..schemas import (
     AreaOut,
     InvoiceCreate,
     InvoiceListItemOut,
     InvoiceLineOut,
+    InvoiceMarkPrintedOut,
     InvoiceOut,
     NextInvoiceNumberOut,
     OpenReceiptOut,
@@ -160,10 +205,19 @@ RECEIPT_OFFSET = 2_000_000  # KABALA(2) * 1_000_000 — see compute_next_invoice
 
 EILAT_AREA = 7  # matches `If Area = EILAT Then` in frmInvoice.frm
 
+# compute_next_invoice_number() below is a plain MAX()+1 read with no
+# locking (see its docstring) — under real concurrent branch traffic two
+# requests can compute the same InvNr at once. create_invoice_core() retries
+# the whole build-and-insert attempt this many times on a primary-key
+# collision (SQLAlchemy IntegrityError) before giving up with a clean 409,
+# rather than letting the loser hit the DB's raw constraint-violation error
+# as an opaque 500 (code review 2026-09-22).
+MAX_INVOICE_NUMBER_RETRIES = 5
+
 router = APIRouter(tags=["invoices"])
 
 LINE_COUNT = 6
-ISSUABLE_TYPES = {HESHBONIT_KABALA, HESHBONIT, KABALA}
+ISSUABLE_TYPES = {HESHBONIT_KABALA, HESHBONIT, KABALA, HESHBONIT_ISKA, CREDIT_NOTE}
 # KABALA (standalone קבלה) has NO line items at all — see frmRec.frm (the
 # dedicated receipt form, 5081 lines): only 6 payment slots and buyer
 # name/TZ, no txtParit/Amount/UnitPrice fields exist on that form.
@@ -205,6 +259,29 @@ def _advance_exp_date(exp_date: Optional[int], months: int) -> int:
     return result
 
 
+def _reduce_exp_date(exp_date: Optional[int], months: int) -> int:
+    """
+    Ported verbatim from CREDIT_NOTE's reduce_months loop in SaveRec():
+        While reduce_months > 0
+            If Int(expDate / 10000) = 1 Then
+                expDate = 120000 + expDate Mod 10000 - 1
+            Else
+                expDate = expDate - 10000
+            End If
+            reduce_months = reduce_months - 1
+        Wend
+    (month*10000+year encoding — January wraps back to December of the
+    previous year, everything else just decrements the month digit.)
+    """
+    result = exp_date or 0
+    for _ in range(months):
+        if result // 10000 == 1:
+            result = 120000 + result % 10000 - 1
+        else:
+            result -= 10000
+    return result
+
+
 def _pricelist_model(is_eilat: bool):
     """`If Area = 7 Then ... PriceListEilat ... Else ... PriceList` — see PriceListEilat model docstring."""
     return PriceListEilat if is_eilat else PriceListItem
@@ -214,6 +291,10 @@ def compute_next_invoice_number(db: Session, doc_type: int) -> int:
     """
     Ported from SaveRec() in Code/frmInvoice.frm. See that function and the
     Invoice model docstring for why types 0/1 are special-cased.
+
+    NOTE: plain MAX()+1, no row/range locking — see MAX_INVOICE_NUMBER_RETRIES
+    and create_invoice_core()'s retry loop for how a concurrent collision on
+    the resulting InvNr is handled.
     """
     if doc_type in (0, 1):
         max_low = db.query(func.max(Invoice.InvNr)).filter(Invoice.InvNr < 1_000_000).scalar() or 0
@@ -343,8 +424,18 @@ def _apply_payments(invoice: Invoice, payments: list[PaymentMethodIn]) -> None:
             payment_type = 1
         elif p.method == "check":
             payment_type = 2
-            if p.checkNr is None:
-                raise HTTPException(status_code=422, detail="checkNr is required for check payments")
+            # All four required together, not just checkNr — CheckCheck() in
+            # frmInvRec.frm always has AccountNr/SnifNr/BankNr in hand when it
+            # runs (CLng()/CInt() on each, no null-guard), and _save_checks()'s
+            # duplicate-check query below needs all four to mean anything: a
+            # check number is only unique within one bank account, so a
+            # checkNr-only requirement could silently save an incomplete,
+            # unidentifiable check row (confirmed 2026-08-19).
+            if p.checkNr is None or p.bankNr is None or p.snifNr is None or p.accountNr is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="checkNr, bankNr, snifNr and accountNr are all required for check payments",
+                )
         elif p.method == "credit":
             if p.creditType not in _CREDIT_TYPE_TO_PAYMENT_TYPE:
                 raise HTTPException(
@@ -374,6 +465,60 @@ def _apply_payments(invoice: Invoice, payments: list[PaymentMethodIn]) -> None:
             setattr(invoice, f"ExpDate{i}", p.cardExpDate)
             if p.creditType == "installments":
                 setattr(invoice, f"CredPayments{i}", p.installments)
+
+
+def _save_checks(db: Session, invoice: Invoice, payments: list[PaymentMethodIn], branch_area: int) -> None:
+    """
+    Ported from SaveChecks() in frmInvRec.frm — one Checks row per check
+    payment slot, ADDITIONAL to (duplicating) the same data already stored
+    inline on the Invoice row's PaymentTypeN/CheckNrN/... columns (see
+    _apply_payments()). Only called for HESHBONIT_KABALA/KABALA — matches
+    the original only invoking SaveChecks() for those two types. Feeds the
+    checks-deposit report in routers/reset.py.
+
+    A duplicate check is rejected up front, across ALL slots before
+    inserting any of them — matches CheckCheck()'s pre-flight loop and its
+    "!!!השק כבר נמצא במאגר" ("this check is already on file") message.
+    "Duplicate" is CheckNr+AccountNr+SnifNr+BankNr together, exactly
+    CheckCheck()'s own query (confirmed 2026-08-19 against frmInvRec.frm —
+    see the Check model docstring) — NOT CheckNr alone, which previously let
+    a real new check through the "already used" door incorrectly whenever
+    its number happened to collide with some other bank's/account's check
+    (false positive), while also failing to catch same-CheckNr reuse within
+    the SAME bank/account/branch once AccountNr/SnifNr/BankNr genuinely
+    matched too (false negative) — db.get() only ever looked at CheckNr.
+    """
+    checks = [p for p in payments if p.method == "check"]
+    if not checks:
+        return
+    for p in checks:
+        existing = (
+            db.query(Check)
+            .filter(
+                Check.CheckNr == p.checkNr,
+                Check.AccountNr == p.accountNr,
+                Check.SnifNr == p.snifNr,
+                Check.BankNr == p.bankNr,
+            )
+            .first()
+        )
+        if existing is not None:
+            raise HTTPException(status_code=409, detail=f"!!!השק כבר נמצא במאגר ({p.checkNr})")
+    for p in checks:
+        db.add(
+            Check(
+                CheckNr=p.checkNr,
+                AccountNr=p.accountNr,
+                SnifNr=p.snifNr,
+                BankNr=p.bankNr,
+                InvNr=invoice.InvNr,
+                Money=p.amount,
+                DueDate=p.checkDate,
+                ResetNr=0,
+                Area=branch_area,
+                BadCheck=False,
+            )
+        )
 
 
 def _to_detail(db: Session, invoice: Invoice) -> InvoiceOut:
@@ -545,7 +690,12 @@ def get_invoice(taxi_nr: int, inv_nr: int, db: Session = Depends(get_db)):
 
 
 @router.get("/account/{taxi_nr}/invoices/{inv_nr}/print", response_class=HTMLResponse)
-def print_invoice(taxi_nr: int, inv_nr: int, db: Session = Depends(get_db)):
+def print_invoice(
+    taxi_nr: int,
+    inv_nr: int,
+    copy: Optional[int] = Query(default=None, description="1='מקור' (original), 0='העתק' (copy) — matches the print-bridge's own convention. Omit to auto-derive from whether this invoice was ever printed before."),
+    db: Session = Depends(get_db),
+):
     """
     Web equivalent of cmdPrint_Click -> frmInvoiceRpt2.Show (Crystal Reports
     isn't available in this stack — see invoice_print.py docstring for why
@@ -553,13 +703,21 @@ def print_invoice(taxi_nr: int, inv_nr: int, db: Session = Depends(get_db)):
     Opening this view marks the invoice Printed=True, same as the original
     treating "printed" as "issued" — there's no separate confirmation step
     in the VB6 flow either.
+
+    The single "הדפס" button on the frontend now decides the מקור/העתק label
+    itself (via POST .../mark-printed, called first so it sees the PRE-print
+    value) and passes `copy` explicitly — the auto-derive fallback here only
+    matters for anyone hitting this URL directly without going through that
+    call first (e.g. a bookmark).
     """
     invoice = db.get(Invoice, inv_nr)
     if invoice is None or invoice.TaxiNr != taxi_nr:
         raise HTTPException(status_code=404, detail=f"No invoice {inv_nr} for taxi {taxi_nr}")
 
+    is_original = (not invoice.Printed) if copy is None else bool(copy)
+
     detail = _to_detail(db, invoice)
-    html_doc = render_invoice_html(detail)
+    html_doc = render_invoice_html(detail, copy=is_original)
 
     if not invoice.Printed:
         invoice.Printed = True
@@ -568,8 +726,48 @@ def print_invoice(taxi_nr: int, inv_nr: int, db: Session = Depends(get_db)):
     return HTMLResponse(content=html_doc)
 
 
+@router.post("/account/{taxi_nr}/invoices/{inv_nr}/mark-printed", response_model=InvoiceMarkPrintedOut)
+def mark_invoice_printed(taxi_nr: int, inv_nr: int, db: Session = Depends(get_db)):
+    """
+    Lets the frontend's single "הדפס" button decide מקור-vs-העתק for the
+    Crystal print-bridge path, which calls localhost:9100 directly and never
+    touches this backend — so it can't rely on print_invoice()'s own
+    Printed-marking above. Returns whether this invoice had ALREADY been
+    printed before this call (so the caller knows: never printed -> print as
+    מקור), then marks it printed for next time. Idempotent — calling this
+    again on an already-printed invoice just reports wasAlreadyPrinted=True
+    and leaves Printed as-is.
+    """
+    invoice = db.get(Invoice, inv_nr)
+    if invoice is None or invoice.TaxiNr != taxi_nr:
+        raise HTTPException(status_code=404, detail=f"No invoice {inv_nr} for taxi {taxi_nr}")
+
+    was_already_printed = bool(invoice.Printed)
+    if not was_already_printed:
+        invoice.Printed = True
+        db.commit()
+
+    return InvoiceMarkPrintedOut(wasAlreadyPrinted=was_already_printed)
+
+
 @router.post("/account/{taxi_nr}/invoices", response_model=InvoiceOut)
 def create_invoice(taxi_nr: int, payload: InvoiceCreate, db: Session = Depends(get_db)):
+    """Public endpoint — always IgnoreInReset=0, matching every ordinary invoice in the original. See create_invoice_core() docstring for the one exception."""
+    return create_invoice_core(taxi_nr, payload, db, ignore_in_reset=0)
+
+
+def create_invoice_core(taxi_nr: int, payload: InvoiceCreate, db: Session, ignore_in_reset: int = 0) -> InvoiceOut:
+    """
+    The actual invoice-creation logic, factored out of the public
+    create_invoice() endpoint so routers/bad_checks.py can reuse it with
+    IgnoreInReset=1/2 — the ONE place in the original app that ever sets
+    that flag to anything but 0 (Main.bas's global `IgnoreInReset`,
+    transiently set around frmRec/frmInvRec calls from frmBackCheck's
+    cmdSave_Click — see BadChecks model docstring). Deliberately NOT exposed
+    as a field on InvoiceCreate/the public endpoint — secretaries issuing a
+    normal invoice have no reason to set it, and doing so would silently
+    change how that document reconciles in a future reset.
+    """
     if payload.doc_type not in ISSUABLE_TYPES:
         raise HTTPException(
             status_code=422,
@@ -594,206 +792,352 @@ def create_invoice(taxi_nr: int, payload: InvoiceCreate, db: Session = Depends(g
     # covers it.
     if payload.doc_type == HESHBONIT and not payload.rec_nr:
         raise HTTPException(status_code=422, detail="אנא הכנס מס' קבלה")
+    # `If InvAction = 3 And val(txtPaidbyNr) = 0 Then` in frmInvoice.frm.
+    if payload.doc_type == HESHBONIT_ISKA and not payload.paid_by_taxi_nr:
+        raise HTTPException(status_code=422, detail="אנא הכנס מספר הלקוח המשלם")
+    if payload.doc_type == CREDIT_NOTE and not payload.credited_inv_nr:
+        raise HTTPException(status_code=422, detail="אנא הכנס מספר חשבונית לזיכוי")
 
     account = db.get(Account, taxi_nr)
     if account is None:
         raise HTTPException(status_code=404, detail=f"No account for TaxiNr {taxi_nr}")
 
+    paid_by_account: Optional[Account] = None
+    if payload.doc_type == HESHBONIT_ISKA:
+        paid_by_account = db.get(Account, payload.paid_by_taxi_nr)
+        if paid_by_account is None:
+            raise HTTPException(status_code=404, detail=f"!!!לקוח לא נמצא {payload.paid_by_taxi_nr}")
+
+    credited_invoice: Optional[Invoice] = None
+    if payload.doc_type == CREDIT_NOTE:
+        # credited_inv_nr is the RAW InvNr (not the display number) — the
+        # frontend already has this whenever it's showing a specific
+        # invoice (it's what GET .../invoices/{inv_nr} is keyed on), so
+        # there's no need to make the caller retype a display number and
+        # re-resolve it here. This matters because display numbers are only
+        # unique WITHIN one type's series — HESHBONIT_KABALA/HESHBONIT share
+        # one combined series but HESHBONIT_ISKA has its own, so e.g.
+        # display number 1 can legitimately exist in both at once; only the
+        # full InvNr (which encodes the type in its millions digit)
+        # disambiguates. Still scoped/validated against this taxi's own
+        # documents, unlike the original's txtRecNrCred which took a typed
+        # number with NO existence check and no taxi-scoping at all.
+        candidate = db.get(Invoice, payload.credited_inv_nr)
+        if (
+            candidate is None
+            or candidate.TaxiNr != taxi_nr
+            or candidate.Type not in (HESHBONIT_KABALA, HESHBONIT, HESHBONIT_ISKA)
+            or candidate.Deleted
+        ):
+            raise HTTPException(
+                status_code=404, detail=f"!!!חשבונית מס' {(payload.credited_inv_nr or 0) % 1_000_000} לא נמצאה עבור מונית זו"
+            )
+        credited_invoice = candidate
+
     cfg = db.query(Cfg).first()
     vat_rate = cfg.VAT if cfg and cfg.VAT is not None else 0
 
-    doc_type = payload.doc_type
-    now = datetime.now()  # computed in Python, not DB-side — func.current_date/time() isn't valid T-SQL
+    # --- everything below builds a fresh Invoice (and touches meter/account/
+    # receipt) and tries to insert it. Wrapped in a retry loop: a primary-key
+    # collision on InvNr (compute_next_invoice_number() has no locking — see
+    # its docstring and MAX_INVOICE_NUMBER_RETRIES above) rolls the session
+    # back and rebuilds everything from scratch with a freshly-recomputed
+    # number, rather than surfacing the DB's raw constraint error as an
+    # opaque 500. account/paid_by_account/credited_invoice/cfg above are
+    # read-only lookups that don't need to be redone on retry; SQLAlchemy
+    # keeps them attached (and auto-refreshes them) across a rollback.
+    for attempt in range(1, MAX_INVOICE_NUMBER_RETRIES + 1):
+        doc_type = payload.doc_type
+        now = datetime.now()  # computed in Python, not DB-side — func.current_date/time() isn't valid T-SQL
 
-    buyer_name = (payload.buyer_name or "").strip()
-    default_name = f"{(account.FamilyName or '').strip()} {(account.PrivatName or '').strip()}".strip()
-    # THIS CALLER's branch (sent from the frontend's per-workstation
-    # setting), not the taxi's Account.Area — see module docstring's Eilat note.
-    branch_area = payload.branch_area
+        buyer_name = (payload.buyer_name or "").strip()
+        default_name = f"{(account.FamilyName or '').strip()} {(account.PrivatName or '').strip()}".strip()
+        # THIS CALLER's branch (sent from the frontend's per-workstation
+        # setting), not the taxi's Account.Area — see module docstring's Eilat note.
+        branch_area = payload.branch_area
 
-    invoice = Invoice(
-        InvNr=compute_next_invoice_number(db, doc_type),
-        TaxiNr=taxi_nr,
-        Type=doc_type,
-        Date=now.date(),
-        Time=now.time(),
-        Area=branch_area,
-        # Explicitly zeroed to match InvRec.Recordset.AddNew in frmInvoice.frm,
-        # which always sets these rather than leaving them at their column
-        # default — cheap insurance against NOT NULL columns with no DB default.
-        Deleted=False,
-        Printed=False,
-        IgnoreInReset=0,
-        Eilat=(branch_area == EILAT_AREA),
-        Name=buyer_name or default_name,
-        Tz=payload.buyer_tz,
-        FamilyName=account.FamilyName,
-        PrivateName=account.PrivatName,
-        Town=account.Town,
-        Street=account.Street,
-        HomeNr=account.HomeNr,
-        ZipCode=account.ZipCode,
-    )
-
-    if doc_type in NO_LINE_ITEM_TYPES:
-        # Matches SaveRec() in frmRec.frm: `InvRec.Recordset![TotalInvs] = 0`
-        # for a receipt — it has no line items and no VAT breakdown of its
-        # own (whatever it's collecting against was already VAT-accounted
-        # for on the original invoice, if any).
-        invoice.TotalInvs = 0
-        invoice.Vat = None
-        invoice.totalVat = None
-    else:
-        # Service/insurance side-effects (see module docstring) only apply to
-        # HESHBONIT_KABALA/HESHBONIT for a real taxi with a real meter attached.
-        meter: Optional[Meter] = None
-        if doc_type in (HESHBONIT_KABALA, HESHBONIT) and taxi_nr < 80000 and account.MeterNr not in NO_METER_SENTINELS:
-            meter = db.get(Meter, account.MeterNr)
-        exp_date_running = meter.ExpDate if meter is not None else None
-        insurance_running = meter.Insurance if meter is not None else None
-        meter_touched = False
-        modem_paid = False
-        # `If Area = 7 Then ... PriceListEilat ... Else ... PriceList` — the
-        # BRANCH's Area (branch_area, from meesql.cfg), not the taxi's own
-        # Account.Area — see PriceListEilat model docstring / _pricelist_model().
-        pricelist_model = _pricelist_model(branch_area == EILAT_AREA)
-
-        total = 0.0
-        for i, line in enumerate(payload.lines, start=1):
-            price_item = db.get(pricelist_model, line.Code)
-            if price_item is None:
-                raise HTTPException(status_code=422, detail=f"Unknown price list code {line.Code}")
-            unit_price = line.UnitPrice if line.UnitPrice is not None else (price_item.Price1 or 0)
-            subtotal = unit_price * line.Amount
-            total += subtotal
-            setattr(invoice, f"Code{i}", line.Code)
-            setattr(invoice, f"Amount{i}", line.Amount)
-            setattr(invoice, f"UnitPrice{i}", unit_price)
-            setattr(invoice, f"SubTotal{i}", subtotal)
-
-            if meter is not None:
-                if price_item.add_modem_service:
-                    modem_paid = True
-
-                add_insurance_flag = bool(price_item.add_insurance)
-                line_add_months = 0
-                if price_item.add_service:
-                    meter_touched = True
-                    insurance_running = False if add_insurance_flag else True
-                    full_total = sum(getattr(price_item, f"Price{n}") or 0 for n in range(1, 7))
-                    if abs(subtotal - full_total) < 0.005:
-                        line_add_months = 12
-                    else:
-                        # Installment payment (subtotal doesn't match the item's
-                        # full combined price) — the office must say how many
-                        # months this particular installment covers, same as
-                        # the original's frmNrEnter prompt (1-18 months).
-                        if line.AddMonths is None:
-                            raise HTTPException(
-                                status_code=422,
-                                detail=f"פריט {line.Code}: אנא הכנס מס' חודשים לקידום (1-18)",
-                            )
-                        if not (1 <= line.AddMonths <= 18):
-                            raise HTTPException(status_code=422, detail="מספר חודשים מירבי הוא 18")
-                        line_add_months = line.AddMonths
-                if add_insurance_flag:
-                    meter_touched = True
-                    insurance_running = False
-
-                if line_add_months:
-                    already_decided = payload.confirm_extend_service or payload.decline_extend_service
-                    if not _is_expired(exp_date_running) and not already_decided:
-                        raise HTTPException(
-                            status_code=409,
-                            detail="CONFIRM_EXTEND_SERVICE: ללקוח יש ביטוח בתוקף — לקדם תקופת ביטוח בכל זאת?",
-                        )
-                    if _is_expired(exp_date_running) or payload.confirm_extend_service:
-                        exp_date_running = _advance_exp_date(exp_date_running, line_add_months)
-                        meter_touched = True
-                    # else (decline_extend_service): matches the original's "no" branch — expDate left unchanged, save proceeds.
-
-        if meter is not None and meter_touched:
-            meter.Insurance = insurance_running
-            meter.ExpDate = exp_date_running
-        if modem_paid:
-            account.ModemPaid = True
-
-        # PriceList prices (and thus these line subtotals) are VAT-INCLUSIVE — `total`
-        # here is the gross amount actually charged, matching txtTotal in
-        # totalInvoice() (frmInvRec.frm). VAT is extracted out of it, not added on
-        # top: txtTotalNet = total*100/(100+VAT), txtMaam (VAT amount) = total-net.
-        net_total = (total * 100 / (100 + vat_rate)) if vat_rate else total
-        total_vat = total - net_total
-        invoice.TotalInvs = net_total  # net (pre-VAT) — GrandTotal = TotalInvs + totalVat recovers the gross total
-        invoice.Vat = vat_rate
-        invoice.totalVat = total_vat
-
-    _apply_payments(invoice, payload.payments)
-
-    if doc_type == HESHBONIT:
-        # Re-validated right before save (not just trusting an earlier
-        # on-screen check) — same "recompute right before commit" pattern as
-        # the invoice number itself. Stores the receipt's RAW InvNr, matching
-        # `InvRec.Recordset![recnr] = frmMain.tmpInvRec.Recordset![invnr]`
-        # in checkRecNr() — NOT the display number that was typed/shown.
-        receipt, _remaining = _validate_open_receipt(db, payload.rec_nr)
-        invoice.RecNr = receipt.InvNr
-        # Ported from cmdSave_Click: `frmMain.tmpInvRec.Recordset![TotalInvs]
-        # = frmMain.tmpInvRec.Recordset![TotalInvs] + val(txtTotal)` — adds
-        # THIS invoice's gross total onto the receipt's own TotalInvs, which
-        # is the same field _validate_open_receipt()'s `remaining` reads
-        # (remaining = payments_total - TotalInvs). `total` here is the
-        # gross/payable sum of this invoice's lines, matching txtTotal
-        # exactly (confirmed via totalInvoice(): txtTotal = Format(sum,
-        # ...), the pre-VAT-extraction gross figure — NOT invoice.TotalInvs,
-        # which stores the NET amount on the invoice's own row). This is what
-        # actually reduces the receipt's open/remaining balance going
-        # forward — without it, the same receipt could be linked past its
-        # real remaining balance.
-        receipt.TotalInvs = (receipt.TotalInvs or 0) + total
-
-    db.add(invoice)
-
-    try:
-        db.flush()  # get invoice.InvNr populated / row visible before the History write
-
-        # Ported verbatim from SaveHistory() in frmInvoice.frm/frmInvRec.frm:
-        #   HistoryRec![invoiceNr] = InvRec![invnr] Mod 1000000   <- DISPLAY number, not the raw InvNr
-        #   HistoryRec![status]     = 60 + InvRec![Type]
-        #   HistoryRec![Area]       = Area   <- the BRANCH's Area (meesql.cfg),
-        #                                       not AccountRec's — same
-        #                                       correction as invoice.Area/Eilat above.
-        #   MeterNr/CarNr/ExpDate are only carried over "if TaxiNr < 80000" —
-        #   80000+ are special/admin accounts without a real meter/car.
-        #   No AmountPaid/AmountGet is set by this save path in the original.
-        history_kwargs = dict(
+        invoice = Invoice(
+            InvNr=compute_next_invoice_number(db, doc_type),
             TaxiNr=taxi_nr,
-            Status=60 + doc_type,
-            Name=invoice.Name,
-            InvoiceNr=invoice.InvNr % 1_000_000,
-            InvType=doc_type,
-            Date=invoice.Date,
-            Time=invoice.Time,
+            Type=doc_type,
+            Date=now.date(),
+            Time=now.time(),
             Area=branch_area,
+            # Explicitly zeroed to match InvRec.Recordset.AddNew in frmInvoice.frm,
+            # which always sets these rather than leaving them at their column
+            # default — cheap insurance against NOT NULL columns with no DB default.
+            # ResetNr=0 in particular matches `InvRec.Recordset![ResetNr] = 0` in
+            # the original and is what routers/reset.py's "not yet reset" scope
+            # query relies on (previously missing here — invoices ended up with
+            # a NULL ResetNr instead, silently working around it elsewhere via
+            # an `= 0 OR IS NULL` pattern, but reset.py's queries expect a real 0).
+            Deleted=False,
+            Printed=False,
+            IgnoreInReset=ignore_in_reset,
+            ResetNr=0,
+            Eilat=(branch_area == EILAT_AREA),
+            # `If Type <> HESHBONIT_ISKA Then name = ...` — the combined Name
+            # field is deliberately left blank for iska documents in the original.
+            Name=None if doc_type == HESHBONIT_ISKA else (buyer_name or default_name),
+            Tz=payload.buyer_tz,
+            FamilyName=account.FamilyName,
+            PrivateName=account.PrivatName,
+            Town=account.Town,
+            Street=account.Street,
+            HomeNr=account.HomeNr,
+            ZipCode=account.ZipCode,
+            AccPaid=paid_by_account.TaxiNr if paid_by_account is not None else None,
+            # PrivatName-then-FamilyName here (reversed from the FamilyName-then-
+            # PrivatName order used for `Name`/default_name above) — matches
+            # txtPaidbyNr_KeyPress's lookup assignment in frmInvoice.frm, which is
+            # what's actually still in txtPaidbyName at save time (a different,
+            # FamilyName-first order is used only when re-DISPLAYING an already-
+            # saved iska document, not when saving one — reproduced as-is).
+            namePaid=(
+                f"{(paid_by_account.PrivatName or '').strip()} {(paid_by_account.FamilyName or '').strip()}".strip()
+                if paid_by_account is not None
+                else None
+            ),
+            RecNr=credited_invoice.InvNr if credited_invoice is not None else None,
         )
-        if taxi_nr < 80000:
-            history_kwargs["CarNr"] = account.CarNr
-            if account.MeterNr is not None and account.MeterNr not in (0, 99999):
+
+        if doc_type in NO_LINE_ITEM_TYPES:
+            # Matches SaveRec() in frmRec.frm: `InvRec.Recordset![TotalInvs] = 0`
+            # for a receipt — it has no line items and no VAT breakdown of its
+            # own (whatever it's collecting against was already VAT-accounted
+            # for on the original invoice, if any).
+            invoice.TotalInvs = 0
+            invoice.Vat = None
+            invoice.totalVat = None
+        else:
+            # Service/insurance side-effects (see module docstring) apply to
+            # HESHBONIT_KABALA/HESHBONIT/CREDIT_NOTE/HESHBONIT_ISKA for a real
+            # taxi with a real meter attached — matches `Type = HESHBONIT_KABALA
+            # Or Type = HESHBONIT Or Type = CREDIT_NOTE Or Type = HESHBONIT_ISKA`
+            # in SaveRec() (NOT just the first two, as Phase 1 had it).
+            meter: Optional[Meter] = None
+            if (
+                doc_type in (HESHBONIT_KABALA, HESHBONIT, CREDIT_NOTE, HESHBONIT_ISKA)
+                and taxi_nr < 80000
+                and account.MeterNr not in NO_METER_SENTINELS
+            ):
                 meter = db.get(Meter, account.MeterNr)
-                history_kwargs["MeterNr"] = account.MeterNr
+            exp_date_running = meter.ExpDate if meter is not None else None
+            insurance_running = meter.Insurance if meter is not None else None
+            meter_touched = False
+            modem_paid = False
+            # `If Area = 7 Then ... PriceListEilat ... Else ... PriceList` — the
+            # BRANCH's Area (branch_area, from meesql.cfg), not the taxi's own
+            # Account.Area — see PriceListEilat model docstring / _pricelist_model().
+            pricelist_model = _pricelist_model(branch_area == EILAT_AREA)
+
+            total = 0.0
+            for i, line in enumerate(payload.lines, start=1):
+                price_item = db.get(pricelist_model, line.Code)
+                if price_item is None:
+                    raise HTTPException(status_code=422, detail=f"Unknown price list code {line.Code}")
+                # Default (no UnitPrice override from the client) is the item's FULL
+                # combined price — sum of Price1..Price6, not just Price1 — matching
+                # ActivateLine() in frmInvRec.frm, which sets both txtUnitPrice and
+                # txtSubTotal to (Price1+...+Price6)*amount. The individual PriceN
+                # values only matter for splitting the *payment schedule* when an
+                # item has more than one of them (see InvoiceModal.tsx's
+                # priceListInstallments()) — the invoice line itself is always
+                # billed for the item's full price (confirmed 2026-08-19).
+                unit_price = (
+                    line.UnitPrice
+                    if line.UnitPrice is not None
+                    else sum(getattr(price_item, f"Price{n}") or 0 for n in range(1, 7))
+                )
+                subtotal = unit_price * line.Amount
+                total += subtotal
+                setattr(invoice, f"Code{i}", line.Code)
+                setattr(invoice, f"Amount{i}", line.Amount)
+                setattr(invoice, f"UnitPrice{i}", unit_price)
+                setattr(invoice, f"SubTotal{i}", subtotal)
+
                 if meter is not None:
-                    history_kwargs["ExpDate"] = meter.ExpDate
+                    if price_item.add_modem_service:
+                        modem_paid = True
 
-        db.add(History(**history_kwargs))
-        db.commit()
-    except SQLAlchemyError as e:
-        db.rollback()
-        # Surfaced verbatim (not just a bare 500) so a schema mismatch is
-        # diagnosable from the browser/network tab without digging through
-        # `docker logs` — this table's nullability wasn't fully confirmed
-        # against the live DB, see Invoice model docstring.
-        raise HTTPException(status_code=500, detail=f"Database error while saving invoice: {e}") from e
+                    add_insurance_flag = bool(price_item.add_insurance)
+                    line_add_months = 0
+                    if price_item.add_service:
+                        meter_touched = True
+                        insurance_running = False if add_insurance_flag else True
+                        full_total = sum(getattr(price_item, f"Price{n}") or 0 for n in range(1, 7))
+                        if abs(subtotal - full_total) < 0.005:
+                            line_add_months = 12
+                        else:
+                            # Installment payment (subtotal doesn't match the item's
+                            # full combined price) — the office must say how many
+                            # months this particular installment covers, same as
+                            # the original's frmNrEnter prompt (1-18 months).
+                            if line.AddMonths is None:
+                                raise HTTPException(
+                                    status_code=422,
+                                    detail=f"פריט {line.Code}: אנא הכנס מס' חודשים לקידום (1-18)",
+                                )
+                            if not (1 <= line.AddMonths <= 18):
+                                raise HTTPException(status_code=422, detail="מספר חודשים מירבי הוא 18")
+                            line_add_months = line.AddMonths
+                    if add_insurance_flag:
+                        meter_touched = True
+                        insurance_running = False
 
-    db.refresh(invoice)
+                    if line_add_months:
+                        already_decided = payload.confirm_extend_service or payload.decline_extend_service
+                        if not _is_expired(exp_date_running) and not already_decided:
+                            if doc_type == CREDIT_NOTE:
+                                raise HTTPException(
+                                    status_code=409,
+                                    detail="CONFIRM_EXTEND_SERVICE: ללקוח יש ביטוח בתוקף — לקצר תקופת ביטוח בכל זאת?",
+                                )
+                            raise HTTPException(
+                                status_code=409,
+                                detail="CONFIRM_EXTEND_SERVICE: ללקוח יש ביטוח בתוקף — לקדם תקופת ביטוח בכל זאת?",
+                            )
+                        if doc_type == CREDIT_NOTE:
+                            # Asymmetric on purpose (matches the original): a
+                            # credit note only ever SHORTENS the expiry when the
+                            # user explicitly confirms — an already-expired
+                            # meter's service is never shortened further, unlike
+                            # the extend case below where "already expired"
+                            # itself is sufficient to proceed without asking.
+                            if payload.confirm_extend_service:
+                                exp_date_running = _reduce_exp_date(exp_date_running, line_add_months)
+                                meter_touched = True
+                        elif _is_expired(exp_date_running) or payload.confirm_extend_service:
+                            exp_date_running = _advance_exp_date(exp_date_running, line_add_months)
+                            meter_touched = True
+                        # else (decline_extend_service): matches the original's "no" branch — expDate left unchanged, save proceeds.
 
-    return _to_detail(db, invoice)
+            if meter is not None and meter_touched:
+                meter.Insurance = insurance_running
+                meter.ExpDate = exp_date_running
+            if modem_paid:
+                account.ModemPaid = True
+
+            # PriceList prices (and thus these line subtotals) are VAT-INCLUSIVE — `total`
+            # here is the gross amount actually charged, matching txtTotal in
+            # totalInvoice() (frmInvRec.frm). VAT is extracted out of it, not added on
+            # top: txtTotalNet = total*100/(100+VAT), txtMaam (VAT amount) = total-net.
+            net_total = (total * 100 / (100 + vat_rate)) if vat_rate else total
+            total_vat = total - net_total
+            invoice.TotalInvs = net_total  # net (pre-VAT) — GrandTotal = TotalInvs + totalVat recovers the gross total
+            invoice.Vat = vat_rate
+            invoice.totalVat = total_vat
+
+            # Ported from checkInv() in frmInvRec.frm: `paid <> totalm` blocks
+            # the save (paid = sum of the payment rows' amounts, totalm = sum of
+            # the line subtotals = `total` here, the gross/pre-VAT-extraction
+            # figure). The original silently no-ops the save button instead of
+            # showing a message — treated as a bug to fix, not replicate, here.
+            # Re-checked server-side (not just trusting the client) since this
+            # is the actual money-integrity guarantee, matching the "recompute
+            # right before commit" pattern used elsewhere in this function.
+            # Skipped when payload.payments is empty: a plain חשבונית that
+            # doesn't collect payment at creation has nothing to reconcile
+            # against (see the doc_type checks above requiring payments only
+            # for HESHBONIT_KABALA/KABALA).
+            if payload.payments:
+                paid = sum(p.amount for p in payload.payments)
+                if abs(paid - total) >= 0.005:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"סכום התשלומים ({paid:.2f}) אינו תואם את סך החשבונית ({total:.2f})",
+                    )
+
+        _apply_payments(invoice, payload.payments)
+        if doc_type in (HESHBONIT_KABALA, KABALA):
+            _save_checks(db, invoice, payload.payments, branch_area)
+
+        if doc_type == HESHBONIT:
+            # Re-validated right before save (not just trusting an earlier
+            # on-screen check) — same "recompute right before commit" pattern as
+            # the invoice number itself. Stores the receipt's RAW InvNr, matching
+            # `InvRec.Recordset![recnr] = frmMain.tmpInvRec.Recordset![invnr]`
+            # in checkRecNr() — NOT the display number that was typed/shown.
+            receipt, _remaining = _validate_open_receipt(db, payload.rec_nr)
+            invoice.RecNr = receipt.InvNr
+            # Ported from cmdSave_Click: `frmMain.tmpInvRec.Recordset![TotalInvs]
+            # = frmMain.tmpInvRec.Recordset![TotalInvs] + val(txtTotal)` — adds
+            # THIS invoice's gross total onto the receipt's own TotalInvs, which
+            # is the same field _validate_open_receipt()'s `remaining` reads
+            # (remaining = payments_total - TotalInvs). `total` here is the
+            # gross/payable sum of this invoice's lines, matching txtTotal
+            # exactly (confirmed via totalInvoice(): txtTotal = Format(sum,
+            # ...), the pre-VAT-extraction gross figure — NOT invoice.TotalInvs,
+            # which stores the NET amount on the invoice's own row). This is what
+            # actually reduces the receipt's open/remaining balance going
+            # forward — without it, the same receipt could be linked past its
+            # real remaining balance.
+            receipt.TotalInvs = (receipt.TotalInvs or 0) + total
+
+        db.add(invoice)
+
+        try:
+            db.flush()  # get invoice.InvNr populated / row visible before the History write
+        except IntegrityError:
+            # Most likely cause: another concurrent request computed and
+            # inserted the same InvNr first (compute_next_invoice_number()
+            # has no locking — see its docstring). Roll back this attempt
+            # entirely (discards this iteration's invoice/check/meter/
+            # receipt/account changes — all cheap, deterministic recomputes)
+            # and try again with a freshly-computed number. account/
+            # paid_by_account/credited_invoice/cfg loaded above stay valid
+            # and get auto-refreshed by SQLAlchemy on next access.
+            db.rollback()
+            if attempt == MAX_INVOICE_NUMBER_RETRIES:
+                raise HTTPException(
+                    status_code=409,
+                    detail="לא ניתן להקצות מספר מסמך עקב עומס במקביל — נסה שוב",
+                )
+            continue
+        except SQLAlchemyError as e:
+            db.rollback()
+            # Surfaced verbatim (not just a bare 500) so a schema mismatch is
+            # diagnosable from the browser/network tab without digging through
+            # `docker logs` — this table's nullability wasn't fully confirmed
+            # against the live DB, see Invoice model docstring.
+            raise HTTPException(status_code=500, detail=f"Database error while saving invoice: {e}") from e
+
+        try:
+            # Ported verbatim from SaveHistory() in frmInvoice.frm/frmInvRec.frm:
+            #   HistoryRec![invoiceNr] = InvRec![invnr] Mod 1000000   <- DISPLAY number, not the raw InvNr
+            #   HistoryRec![status]     = 60 + InvRec![Type]
+            #   HistoryRec![Area]       = Area   <- the BRANCH's Area (meesql.cfg),
+            #                                       not AccountRec's — same
+            #                                       correction as invoice.Area/Eilat above.
+            #   MeterNr/CarNr/ExpDate are only carried over "if TaxiNr < 80000" —
+            #   80000+ are special/admin accounts without a real meter/car.
+            #   No AmountPaid/AmountGet is set by this save path in the original.
+            history_kwargs = dict(
+                TaxiNr=taxi_nr,
+                Status=60 + doc_type,
+                Name=invoice.Name,
+                InvoiceNr=invoice.InvNr % 1_000_000,
+                InvType=doc_type,
+                Date=invoice.Date,
+                Time=invoice.Time,
+                Area=branch_area,
+            )
+            if taxi_nr < 80000:
+                history_kwargs["CarNr"] = account.CarNr
+                if account.MeterNr is not None and account.MeterNr not in (0, 99999):
+                    meter = db.get(Meter, account.MeterNr)
+                    history_kwargs["MeterNr"] = account.MeterNr
+                    if meter is not None:
+                        history_kwargs["ExpDate"] = meter.ExpDate
+
+            db.add(History(**history_kwargs))
+            db.commit()
+        except SQLAlchemyError as e:
+            db.rollback()
+            raise HTTPException(status_code=500, detail=f"Database error while saving invoice: {e}") from e
+
+        db.refresh(invoice)
+        return _to_detail(db, invoice)
+
+    # Unreachable — the loop above always either returns or raises.
+    raise HTTPException(status_code=500, detail="create_invoice_core: retry loop exited without returning")

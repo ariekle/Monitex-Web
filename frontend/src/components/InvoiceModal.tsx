@@ -5,10 +5,12 @@ import {
   fetchInvoice,
   fetchNextInvoiceNumber,
   fetchVatRate,
+  markInvoicePrinted,
   fetchOpenReceipts,
   validateOpenReceipt,
   createInvoice,
   priceListFullTotal,
+  priceListInstallments,
   ConfirmExtendServiceError,
   type PriceListItem,
   type InvoiceListItem,
@@ -18,6 +20,9 @@ import {
   type OpenReceipt,
 } from '../api/invoices'
 import { getStoredBranchArea } from '../api/branch'
+import { bankName } from '../utils/bankNames'
+import { fetchAccount, AccountNotFoundError } from '../api/account'
+import { isPrintBridgeAvailable, invoicePrintUrl } from '../api/printBridge'
 import { formatDate, formatTime } from '../utils/format'
 
 /**
@@ -29,21 +34,24 @@ import { formatDate, formatTime } from '../utils/format'
  * view-only (works for any type, since viewing is just a read) or stubbed.
  */
 
+// Labels match lblLabels(1) in frmInvoice.frm exactly (`:חשבונית עיסקה` /
+// `:חשבונית זיכוי`) — no תעודת משלוח item, per explicit request (not needed).
 const DOC_TYPES = [
   { type: 0, label: 'חש/קבלה' },
   { type: 1, label: 'חשבונית' },
   { type: 2, label: 'קבלה' },
-  { type: 3, label: 'חש. עסקה' },
-  { type: 4, label: 'ת. זיכוי' },
-  { type: 5, label: 'ת. משלוח' },
+  { type: 3, label: 'חשבונית עסקה' },
+  { type: 4, label: 'חשבונית זיכוי' },
 ]
 
-// HESHBONIT_KABALA(0, חש/קבלה), HESHBONIT(1, חשבונית) and KABALA(2, קבלה) —
-// see backend routers/invoices.py
-const ISSUABLE_TYPES = new Set([0, 1, 2])
+// HESHBONIT_KABALA(0), HESHBONIT(1), KABALA(2), HESHBONIT_ISKA(3),
+// CREDIT_NOTE(4) — see backend routers/invoices.py ISSUABLE_TYPES
+const ISSUABLE_TYPES = new Set([0, 1, 2, 3, 4])
 const HESHBONIT_KABALA = 0
 const HESHBONIT = 1
 const KABALA = 2
+const HESHBONIT_ISKA = 3
+const CREDIT_NOTE = 4
 
 type View =
   | { kind: 'menu' }
@@ -54,7 +62,7 @@ type View =
 interface DraftLine {
   code: string
   amount: string
-  unitPrice: string // blank = let the server default from PriceList.Price1
+  unitPrice: string // blank = let the server default from PriceList's full combined price (Price1+...+Price6), see selectCode()
   // Only used/shown when the selected item has add_service=true and the line's
   // subtotal doesn't match the item's full combined price (Price1+...+Price6) —
   // i.e. an installment payment rather than a one-shot full payment. See
@@ -96,6 +104,42 @@ function emptyPayment(): DraftPayment {
     cardExpDate: '',
     creditType: 'regular',
     installments: '',
+  }
+}
+
+/** Digits only, capped at maxLen — matches the original's KeyPress digit-filter + MaxLength combo on these fields (see call sites for the source MaxLength value). */
+function onlyDigits(raw: string, maxLen: number): string {
+  return raw.replace(/\D/g, '').slice(0, maxLen)
+}
+
+/** today + N months, as DD/MM/YYYY — matches CalMoney()'s `DateAdd("m", i, date)` scheduling for auto-generated installment payments (see derivedInstallments below). */
+function addMonthsDDMMYYYY(months: number): string {
+  const d = new Date()
+  d.setMonth(d.getMonth() + months)
+  return `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')}/${d.getFullYear()}`
+}
+
+/**
+ * Web equivalent of VB6's implicit "Enter advances to the next field"
+ * behavior — every txtXxx_KeyPress handler in the .frm files treats
+ * vbKeyReturn as "move on", not "submit". There's no <form> wrapping this
+ * modal, so a plain <input> does nothing on Enter by default; call this from
+ * onKeyDown to make Enter act like Tab instead (requested 2026-08-19 for the
+ * invoice line fields). Moves to the next element in normal DOM tab order,
+ * not a hardcoded per-field list, so it stays correct if fields are
+ * reordered/added.
+ */
+function focusNextField(e: React.KeyboardEvent<HTMLElement>) {
+  if (e.key !== 'Enter') return
+  e.preventDefault()
+  const focusable = Array.from(
+    document.querySelectorAll<HTMLElement>(
+      'input:not([disabled]), button:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    ),
+  ).filter((el) => el.offsetParent !== null) // visible only
+  const idx = focusable.indexOf(e.currentTarget as HTMLElement)
+  if (idx >= 0 && idx + 1 < focusable.length) {
+    focusable[idx + 1].focus()
   }
 }
 
@@ -144,7 +188,8 @@ function CodePickerPopup({
             onClick={() => onSelect(p.Code)}
           >
             {p.Code} — {p.Name ?? ''}
-            {p.Price1 != null ? ` (${p.Price1})` : ''}
+            {/* Full combined price (Price1+...+Price6) — what the line will actually be billed, not just its first installment. */}
+            {priceListFullTotal(p) > 0 ? ` (${priceListFullTotal(p)})` : ''}
           </li>
         ))}
         {filtered.length === 0 && <li className="px-2 py-1 text-xl text-slate-500">אין תוצאות</li>}
@@ -207,6 +252,61 @@ function ReceiptPickerPopup({
   )
 }
 
+/**
+ * Picker for the document a CREDIT_NOTE(4) is crediting — scoped to THIS
+ * taxi's own creditable documents (HESHBONIT_KABALA/HESHBONIT/
+ * HESHBONIT_ISKA), passing back the RAW InvNr rather than a display number
+ * the caller would have to retype — see createInvoice()/routers/invoices.py
+ * on why display numbers alone are ambiguous across document types.
+ */
+function CreditedInvoicePickerPopup({
+  invoices,
+  onSelect,
+  onClose,
+}: {
+  invoices: InvoiceListItem[]
+  onSelect: (invoice: InvoiceListItem) => void
+  onClose: () => void
+}) {
+  const [filter, setFilter] = useState('')
+  const q = filter.trim()
+  const filtered = invoices.filter(
+    (i) => q === '' || String(i.DisplayNr).includes(q) || (i.Name ?? '').includes(q),
+  )
+
+  return (
+    <div
+      className="absolute right-0 top-full z-20 mt-1 w-80 border border-slate-500 bg-white text-right shadow-xl"
+      onClick={(e) => e.stopPropagation()}
+    >
+      <input
+        autoFocus
+        type="text"
+        value={filter}
+        onChange={(e) => setFilter(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Escape') onClose()
+        }}
+        placeholder="חיפוש לפי מס' חשבונית או שם..."
+        className="w-full border-b border-slate-300 px-2 py-1 text-xl focus:outline-none"
+      />
+      <ul className="max-h-56 overflow-auto">
+        {filtered.map((i) => (
+          <li
+            key={i.InvNr}
+            className="cursor-pointer px-2 py-1 text-xl hover:bg-sky-100"
+            onClick={() => onSelect(i)}
+          >
+            {i.DisplayNr} — {i.TypeLabel ?? ''} · {i.Name ?? ''}
+            {i.GrandTotal != null ? ` (${i.GrandTotal.toFixed(2)})` : ''}
+          </li>
+        ))}
+        {filtered.length === 0 && <li className="px-2 py-1 text-xl text-slate-500">אין חשבוניות מתאימות</li>}
+      </ul>
+    </div>
+  )
+}
+
 export default function InvoiceModal({
   taxiNr,
   mode,
@@ -225,11 +325,19 @@ export default function InvoiceModal({
     initialInvNr != null ? { kind: 'detail', invNr: initialInvNr } : { kind: 'menu' },
   )
 
+  // Only anchor near the top for the actual invoice content (issuing or
+  // viewing one) — the doc-type menu and the past-invoices list stay
+  // vertically centered like every other modal in this app.
+  const anchorTop = view.kind === 'create' || view.kind === 'detail'
+
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={onClose}>
+    <div
+      className={`fixed inset-0 z-50 flex justify-center overflow-y-auto bg-black/40 ${anchorTop ? 'items-start pt-[2vh]' : 'items-center'}`}
+      onClick={onClose}
+    >
       <div
         dir="rtl"
-        className="flex max-h-[85vh] w-[90vw] max-w-3xl flex-col border border-slate-500 bg-[#EFEDE6] shadow-xl"
+        className="flex max-h-[96vh] w-[95vw] max-w-5xl flex-col border border-slate-500 bg-[#EFEDE6] shadow-xl"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between border-b-2 border-yellow-400 px-4 py-2">
@@ -316,7 +424,7 @@ function MenuView({ mode, onSelect }: { mode: 'issue' | 'copy'; onSelect: (type:
       </div>
       {stubType !== null && (
         <div className="border border-amber-300 bg-amber-50 px-3 py-1.5 text-xl text-amber-800">
-          הנפקת "{DOC_TYPES.find((d) => d.type === stubType)?.label}" עדיין לא נבנתה — כרגע ניתן להנפיק רק חש/קבלה, חשבונית וקבלה.
+          הנפקת "{DOC_TYPES.find((d) => d.type === stubType)?.label}" עדיין לא נבנתה.
         </div>
       )}
     </div>
@@ -342,6 +450,12 @@ function CreateInvoiceView({
   const [payments, setPayments] = useState<DraftPayment[]>(
     docType === HESHBONIT_KABALA || docType === KABALA ? [emptyPayment()] : [],
   )
+  // True while the payments array is still fully auto-derived (either the
+  // single-payment-synced-to-total case below, or the multi-installment
+  // case) — set to false the moment the user manually touches any payment
+  // field, add/remove button, etc., so we never fight their edits. See the
+  // useEffect below and the derivedInstallments computation.
+  const [installmentsAutoManaged, setInstallmentsAutoManaged] = useState(true)
   const [buyerName, setBuyerName] = useState(defaultBuyerName ?? '')
   const [buyerTz, setBuyerTz] = useState('')
   const [nextNumber, setNextNumber] = useState<number | null>(null)
@@ -363,10 +477,23 @@ function CreateInvoiceView({
     invoicePayments: PaymentMethodInput[]
     buyer: { name?: string; tz?: number } | undefined
     recNr: number | undefined
+    paidByTaxiNr?: number
+    creditedInvNr?: number
   } | null>(null)
+  // Paid-by-account linking (txtPaidbyNr in frmInvoice.frm) — required for HESHBONIT_ISKA.
+  const [paidByTaxiNrInput, setPaidByTaxiNrInput] = useState('')
+  const [paidByName, setPaidByName] = useState<string | null>(null)
+  const [paidByError, setPaidByError] = useState<string | null>(null)
+  const [paidByChecking, setPaidByChecking] = useState(false)
+  // Credited-document linking (txtRecNrCred in frmInvoice.frm) — required for CREDIT_NOTE.
+  const [creditedInvoice, setCreditedInvoice] = useState<InvoiceListItem | null>(null)
+  const [creditedPickerOpen, setCreditedPickerOpen] = useState(false)
+  const [creditableInvoices, setCreditableInvoices] = useState<InvoiceListItem[]>([])
   const needsPayment = docType === HESHBONIT_KABALA || docType === KABALA
   const needsBuyerDetails = docType === HESHBONIT_KABALA || docType === KABALA
   const needsRecNr = docType === HESHBONIT
+  const needsPaidBy = docType === HESHBONIT_ISKA
+  const needsCreditedInvoice = docType === CREDIT_NOTE
   // Standalone קבלה (frmRec.frm) has no line items at all — only 6 payment
   // slots. See routers/invoices.py NO_LINE_ITEM_TYPES / module docstring.
   const hasLineItems = docType !== KABALA
@@ -437,6 +564,55 @@ function CreateInvoiceView({
     setReceiptPickerOpen(false)
   }
 
+  // Ported from txtPaidbyNr_KeyPress in frmInvoice.frm — looks up the
+  // paying account and shows its resolved name, PrivatName-then-FamilyName
+  // (matches namePaid's order — NOT the FamilyName-then-PrivatName order
+  // used for the invoice's own display Name elsewhere; a genuine
+  // inconsistency in the original, reproduced faithfully here).
+  async function checkPaidByInput() {
+    const n = Number(paidByTaxiNrInput)
+    if (!paidByTaxiNrInput.trim() || !n) {
+      setPaidByName(null)
+      setPaidByError(null)
+      return
+    }
+    setPaidByChecking(true)
+    setPaidByError(null)
+    try {
+      const account = await fetchAccount(n)
+      setPaidByName(`${account.PrivatName ?? ''} ${account.FamilyName ?? ''}`.trim())
+    } catch (e) {
+      setPaidByName(null)
+      setPaidByError(e instanceof AccountNotFoundError ? `!!!לקוח לא נמצא ${n}` : 'שגיאה באיתור לקוח')
+    } finally {
+      setPaidByChecking(false)
+    }
+  }
+
+  // Ported from txtRecNrCred in frmInvoice.frm — the picker fetches this
+  // taxi's own invoices and filters client-side to the types the server
+  // will actually accept as creditable (see credited_invoice validation in
+  // routers/invoices.py's create_invoice()).
+  function openCreditedPicker() {
+    setCreditedPickerOpen(true)
+    fetchInvoices(taxiNr)
+      .then((all) =>
+        setCreditableInvoices(
+          all.filter(
+            (i) =>
+              !i.Deleted &&
+              (i.Type === HESHBONIT_KABALA || i.Type === HESHBONIT || i.Type === HESHBONIT_ISKA),
+          ),
+        ),
+      )
+      .catch(() => setCreditableInvoices([]))
+  }
+
+  function selectCreditedInvoice(invoice: InvoiceListItem) {
+    setCreditedInvoice(invoice)
+    setCreditedPickerOpen(false)
+  }
+
   function updateLine(index: number, patch: Partial<DraftLine>) {
     setLines((prev) => prev.map((l, i) => (i === index ? { ...l, ...patch } : l)))
   }
@@ -455,16 +631,33 @@ function CreateInvoiceView({
     return priceList.find((p) => p.Code === code)
   }
 
-  /** Sets the code and — if the line's price is still blank — fills it in from the price list, as an editable value the user can then override. */
+  /**
+   * Sets the code and fills the line's price in from the new item's price
+   * list entry, as an editable value the user can then override. Always
+   * overwrites — not just when blank — because a price left over from
+   * whatever item was previously picked on this line is never the price the
+   * user wants for a different item; keeping it silently produced invoices
+   * billed at the wrong product's price whenever a line's item was changed
+   * after its price had already been auto-filled once (reported 2026-08-19).
+   *
+   * Fills in the FULL combined price (sum of Price1..Price6), not just
+   * Price1 — confirmed against ActivateLine() in frmInvRec.frm, which sets
+   * both txtUnitPrice and txtSubTotal to `(Price1+...+Price6) * amount`.
+   * The individual PriceN values only matter for splitting the *payment
+   * schedule* (see priceListInstallments()/derivedInstallments in this
+   * file) — the invoice line itself is always billed for the item's full
+   * price (reported 2026-08-19).
+   */
   function selectCode(index: number, code: number) {
     const item = priceList.find((p) => p.Code === code)
+    const fullPrice = item ? priceListFullTotal(item) : null
     setLines((prev) =>
       prev.map((l, i) =>
         i === index
           ? {
               ...l,
               code: String(code),
-              unitPrice: l.unitPrice.trim() === '' && item?.Price1 != null ? String(item.Price1) : l.unitPrice,
+              unitPrice: fullPrice != null ? String(fullPrice) : '',
             }
           : l,
       ),
@@ -474,7 +667,7 @@ function CreateInvoiceView({
   function lineTotal(line: DraftLine): number {
     const amount = Number(line.amount) || 0
     const item = priceFor(line.code)
-    const unitPrice = line.unitPrice.trim() !== '' ? Number(line.unitPrice) : item?.Price1 ?? 0
+    const unitPrice = line.unitPrice.trim() !== '' ? Number(line.unitPrice) : item ? priceListFullTotal(item) : 0
     return amount * unitPrice
   }
 
@@ -493,15 +686,52 @@ function CreateInvoiceView({
   }
 
   function updatePayment(index: number, patch: Partial<DraftPayment>) {
+    setInstallmentsAutoManaged(false)
     setPayments((prev) => prev.map((p, i) => (i === index ? { ...p, ...patch } : p)))
+  }
+
+  /**
+   * Once the first check-method payment's account/bank/branch/check-number
+   * is filled in, copies account/bank/branch verbatim and the check number
+   * incremented by 1 per row into the other check-method payments — a
+   * scheduled series of post-dated checks (the auto-generated installment
+   * payments, see derivedInstallments above) is drawn from the same
+   * checkbook, so re-typing the same account/bank/branch and manually
+   * incrementing the check number for every row would be pure busywork
+   * (requested 2026-08-19). Wired to onBlur (not onChange) on those four
+   * fields so it copies the finished value rather than one half-typed
+   * character at a time; a no-op unless `index` is the first check row.
+   * Always overwrites the other rows (not just blank ones), so correcting
+   * the first check's details afterward re-syncs everywhere.
+   */
+  function cascadeCheckDetailsFromFirst(index: number) {
+    setPayments((prev) => {
+      const checkIndexes = prev.reduce<number[]>((acc, p, i) => (p.method === 'check' ? [...acc, i] : acc), [])
+      if (checkIndexes[0] !== index) return prev
+      const source = prev[index]
+      const baseCheckNr = source.checkNr.trim() !== '' ? Number(source.checkNr) : null
+      return prev.map((p, i) => {
+        if (i === index || p.method !== 'check') return p
+        const ordinal = checkIndexes.indexOf(i) // position among check rows; first check row is ordinal 0
+        return {
+          ...p,
+          bankNr: source.bankNr,
+          snifNr: source.snifNr,
+          accountNr: source.accountNr,
+          checkNr: baseCheckNr != null && Number.isFinite(baseCheckNr) ? String(baseCheckNr + ordinal) : p.checkNr,
+        }
+      })
+    })
   }
 
   function addPayment() {
     if (payments.length >= 6) return
+    setInstallmentsAutoManaged(false)
     setPayments((prev) => [...prev, emptyPayment()])
   }
 
   function removePayment(index: number) {
+    setInstallmentsAutoManaged(false)
     setPayments((prev) => prev.filter((_, i) => i !== index))
   }
 
@@ -517,20 +747,71 @@ function CreateInvoiceView({
   const previewVatAmount = previewTotal - previewNetTotal
   const remainingBalance = previewTotal - paidSoFar
 
-  // Default the (single, common case) payment amount to the invoice total,
-  // so the user doesn't have to type/copy it manually — stays in sync as
-  // lines change, but stops once the user edits it themselves. Only
-  // meaningful when there are line items to total up to; for a קבלה the
-  // payment amount itself IS the total, so this would just be circular.
-  useEffect(() => {
-    if (hasLineItems && payments.length === 1 && !payments[0].amountTouched) {
-      const nextAmount = previewTotal > 0 ? previewTotal.toFixed(2) : ''
-      if (payments[0].amount !== nextAmount) {
-        setPayments((prev) => prev.map((p, i) => (i === 0 ? { ...p, amount: nextAmount } : p)))
-      }
+  // Per-payment-slot sums (index 0 = due now, 1 = due in a month, ...) across
+  // every line whose item has more than one non-zero PriceN column — each
+  // slot's amount is that PriceN itself (times the line's quantity), NOT an
+  // equal split of the line's total (confirmed 2026-08-19; see
+  // priceListInstallments()'s docstring). Lines are summed slot-by-slot so
+  // two installment items on the same invoice combine into one payment per
+  // due date, matching CalMoney() in frmInvRec.frm. null when no line needs
+  // more than one payment, in which case the single-payment sync below
+  // applies instead.
+  const derivedInstallments = (() => {
+    const sums = [0, 0, 0, 0, 0, 0]
+    let maxCount = 0
+    for (const l of lines) {
+      if (l.code.trim() === '') continue
+      const item = priceFor(l.code)
+      if (!item) continue
+      const perPayment = priceListInstallments(item)
+      if (perPayment.length <= 1) continue
+      const qty = Number(l.amount) || 0
+      perPayment.forEach((price, i) => {
+        sums[i] += price * qty
+      })
+      maxCount = Math.max(maxCount, perPayment.length)
     }
+    return maxCount > 1 ? sums.slice(0, maxCount) : null
+  })()
+
+  // Keeps the payments array auto-derived from the lines — either as a
+  // single payment synced to the invoice total (the common case), or, once
+  // an installment-priced item is on the invoice, as one payment per
+  // derivedInstallments slot (the web equivalent of CalMoney()/
+  // ActivateLine() auto-splitting a multi-price item's charge into several
+  // scheduled payments rather than one lump sum). Stops the moment the user
+  // touches any payment field/button (installmentsAutoManaged becomes
+  // false) so it never fights a manual edit. Only meaningful when there are
+  // line items to derive from; for a standalone קבלה the payment amount
+  // itself IS the total, so nothing to sync. Also does nothing when the
+  // doc type started with zero payment rows (plain חשבונית, not
+  // חשבונית-קבלה/קבלה) — those types don't collect payment at all when the
+  // invoice is created, so this must never invent a payment row out of
+  // thin air just because an installment item was added to the lines.
+  useEffect(() => {
+    if (!hasLineItems || !installmentsAutoManaged || payments.length === 0) return
+    const desired: DraftPayment[] = derivedInstallments
+      ? derivedInstallments.map((amt, i) => ({
+          ...emptyPayment(),
+          // Defaults each row to a post-dated check due that month — the
+          // realistic real-world mechanism for a scheduled future payment.
+          // The source's own default payment-type marker is unreadable in
+          // the mangled-encoding .frm file, so this is a judgment call;
+          // every field here (method, date, amount) is freely editable.
+          method: 'check',
+          amount: amt > 0 ? amt.toFixed(2) : '',
+          checkDate: addMonthsDDMMYYYY(i),
+        }))
+      : [{ ...emptyPayment(), amount: previewTotal > 0 ? previewTotal.toFixed(2) : '' }]
+
+    const changed =
+      desired.length !== payments.length ||
+      desired.some(
+        (p, i) => p.amount !== payments[i]?.amount || p.checkDate !== payments[i]?.checkDate || p.method !== payments[i]?.method,
+      )
+    if (changed) setPayments(desired)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [previewTotal, payments.length, hasLineItems])
+  }, [derivedInstallments, previewTotal, hasLineItems, installmentsAutoManaged])
 
   async function handleSubmit() {
     setError(null)
@@ -567,8 +848,16 @@ function CreateInvoiceView({
       return
     }
     for (const p of validPayments) {
-      if (p.method === 'check' && p.checkNr.trim() === '') {
-        setError('יש להזין מספר שיק עבור תשלום בשיק')
+      if (
+        p.method === 'check' &&
+        (p.checkNr.trim() === '' || p.bankNr.trim() === '' || p.snifNr.trim() === '' || p.accountNr.trim() === '')
+      ) {
+        // All four required together — a check number is only unique
+        // within one bank account, so the "already used" duplicate check
+        // (CheckCheck() in frmInvRec.frm, see _save_checks() backend-side)
+        // needs bank+branch+account too, not just the check number
+        // (confirmed 2026-08-19).
+        setError('יש להזין מספר שיק, בנק, סניף ומספר חשבון עבור תשלום בשיק')
         return
       }
       if (p.method === 'credit') {
@@ -581,6 +870,54 @@ function CreateInvoiceView({
           return
         }
       }
+    }
+    // Ported from checkInv() in frmInvRec.frm: `paid <> totalm` blocks the
+    // save (paid = sum of the payment rows' amounts, totalm = sum of the
+    // line subtotals) — the original silently exits the save without a
+    // message, which we treat as a bug to fix rather than replicate (a
+    // real error the cashier can act on, not a save button that quietly
+    // does nothing). Only checked when this invoice actually collects
+    // payment (payments.length > 0); a plain חשבונית with no payment rows
+    // has nothing to reconcile against. 0.005 tolerance for float rounding.
+    if (payments.length > 0 && Math.abs(paidSoFar - previewTotal) >= 0.005) {
+      setError(
+        `סכום התשלומים (${paidSoFar.toFixed(2)}) אינו תואם את סך החשבונית (${previewTotal.toFixed(2)}) — יש לתקן לפני השמירה`,
+      )
+      return
+    }
+    // Ported from `If val(txtPaidbyNr) = 0 Then ... "אנא הכנס מספר לקוח"` in
+    // frmInvoice.frm's SaveRec() for HESHBONIT_ISKA.
+    let paidByTaxiNr: number | undefined
+    if (needsPaidBy) {
+      const n = Number(paidByTaxiNrInput)
+      if (!paidByTaxiNrInput.trim() || !n) {
+        setError('אנא הכנס מספר לקוח')
+        return
+      }
+      setPaidByChecking(true)
+      try {
+        const account = await fetchAccount(n)
+        setPaidByName(`${account.PrivatName ?? ''} ${account.FamilyName ?? ''}`.trim())
+        setPaidByError(null)
+        paidByTaxiNr = n
+      } catch (e) {
+        const msg = e instanceof AccountNotFoundError ? `!!!לקוח לא נמצא ${n}` : 'שגיאה באיתור לקוח'
+        setPaidByError(msg)
+        setError(msg)
+        return
+      } finally {
+        setPaidByChecking(false)
+      }
+    }
+    // Ported from `If val(txtRecNrCred) = 0 Then ... "אנא הכנס מספר חשבונית לזיכוי"`
+    // in frmInvoice.frm's SaveRec() for CREDIT_NOTE.
+    let creditedInvNr: number | undefined
+    if (needsCreditedInvoice) {
+      if (!creditedInvoice) {
+        setError('אנא הכנס מספר חשבונית לזיכוי')
+        return
+      }
+      creditedInvNr = creditedInvoice.InvNr
     }
     // `If InvAction = HESHBONIT And val(txtRecNr) = 0 Then` blocks save in
     // frmInvoice.frm — re-validated right here (not just trusting an earlier
@@ -644,7 +981,7 @@ function CreateInvoiceView({
     }))
     const buyer = needsBuyerDetails ? { name: buyerName.trim(), tz: Number(buyerTz) } : undefined
 
-    await submitInvoice(invoiceLines, invoicePayments, buyer, recNr)
+    await submitInvoice(invoiceLines, invoicePayments, buyer, recNr, undefined, paidByTaxiNr, creditedInvNr)
   }
 
   /**
@@ -658,6 +995,8 @@ function CreateInvoiceView({
     buyer: { name?: string; tz?: number } | undefined,
     recNr: number | undefined,
     extendServiceDecision?: 'confirm' | 'decline',
+    paidByTaxiNr?: number,
+    creditedInvNr?: number,
   ) {
     const branchArea = getStoredBranchArea()
     if (branchArea === null) {
@@ -675,12 +1014,14 @@ function CreateInvoiceView({
         buyer,
         recNr,
         extendServiceDecision,
+        paidByTaxiNr,
+        creditedInvNr,
       )
       onCreated(result.InvNr)
     } catch (e) {
       if (e instanceof ConfirmExtendServiceError) {
         setExtendServiceConfirm(e.message)
-        setPendingSubmit({ invoiceLines, invoicePayments, buyer, recNr })
+        setPendingSubmit({ invoiceLines, invoicePayments, buyer, recNr, paidByTaxiNr, creditedInvNr })
       } else {
         setError(e instanceof Error ? e.message : 'Failed to create invoice')
       }
@@ -694,6 +1035,7 @@ function CreateInvoiceView({
       onClick={() => {
         if (codePickerIndex !== null) setCodePickerIndex(null)
         if (receiptPickerOpen) setReceiptPickerOpen(false)
+        if (creditedPickerOpen) setCreditedPickerOpen(false)
       }}
     >
       <div className="mb-3 flex items-center justify-between">
@@ -739,7 +1081,7 @@ function CreateInvoiceView({
                 type="button"
                 title="F1 — בחר מרשימת קבלות פתוחות"
                 onClick={openReceiptPicker}
-                className="win-button px-1 text-base leading-none"
+                className="win-button h-7 px-1 py-0 text-base leading-none"
               >
                 F1
               </button>
@@ -761,6 +1103,75 @@ function CreateInvoiceView({
             )}
             {!recNrChecking && recNrError && <span className="text-red-700">{recNrError}</span>}
           </div>
+        </div>
+      )}
+
+      {needsPaidBy && (
+        <div className="mb-3 flex flex-wrap items-end gap-3 border-b border-slate-300 pb-3">
+          <div>
+            <label className="block text-[17px] text-slate-600">מספר לקוח משלם</label>
+            <input
+              type="text"
+              value={paidByTaxiNrInput}
+              onChange={(e) => {
+                setPaidByTaxiNrInput(e.target.value)
+                setPaidByName(null)
+                setPaidByError(null)
+              }}
+              onBlur={() => void checkPaidByInput()}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault()
+                  void checkPaidByInput()
+                }
+              }}
+              className="h-7 w-28 border border-slate-400 bg-white px-1 shadow-[inset_1px_1px_2px_rgba(0,0,0,0.15)] focus:outline-none"
+            />
+          </div>
+          <div className="text-lg">
+            {paidByChecking && <span className="text-slate-500">בודק...</span>}
+            {!paidByChecking && paidByName && <span className="text-emerald-700">{paidByName}</span>}
+            {!paidByChecking && paidByError && <span className="text-red-700">{paidByError}</span>}
+          </div>
+        </div>
+      )}
+
+      {needsCreditedInvoice && (
+        <div className="relative mb-3 flex flex-wrap items-end gap-3 border-b border-slate-300 pb-3">
+          <div className="relative">
+            <label className="block text-[17px] text-slate-600">מספר חשבונית לזיכוי</label>
+            <button
+              type="button"
+              onClick={openCreditedPicker}
+              // py-0/leading-none: without these, .win-button's own py-2.5
+              // padding fights the fixed h-7 height (padding+line-height
+              // wants ~48px inside a 28px box), so the text overflowed the
+              // button and the button's own border rendered as a line
+              // straight through the middle of it — the "strikethrough"
+              // look reported 2026-08-19, both before and after picking an
+              // invoice. Every other h-7/h-6 win-button in this file
+              // already overrides py-0 (e.g. line ~918) for this reason;
+              // this one had been missed.
+              className="win-button flex h-7 min-w-[10rem] items-center justify-center whitespace-nowrap px-2 py-0 text-lg leading-none"
+            >
+              {creditedInvoice
+                ? `${creditedInvoice.DisplayNr}${creditedInvoice.TypeLabel ? ` — ${creditedInvoice.TypeLabel}` : ''}`
+                : 'בחר חשבונית...'}
+            </button>
+            {creditedPickerOpen && (
+              <CreditedInvoicePickerPopup
+                invoices={creditableInvoices}
+                onSelect={selectCreditedInvoice}
+                onClose={() => setCreditedPickerOpen(false)}
+              />
+            )}
+          </div>
+          {creditedInvoice && (
+            <div className="text-lg text-emerald-700">
+              {creditedInvoice.Name ?? ''}
+              {creditedInvoice.GrandTotal != null ? ` · ${creditedInvoice.GrandTotal.toFixed(2)}` : ''}
+            </div>
+          )}
         </div>
       )}
 
@@ -828,6 +1239,8 @@ function CreateInvoiceView({
                         if (e.key === 'F1') {
                           e.preventDefault()
                           if (!productsLocked) setCodePickerIndex(i)
+                        } else {
+                          focusNextField(e)
                         }
                       }}
                       className="h-6 w-20 border border-slate-400 bg-white px-1 shadow-[inset_1px_1px_2px_rgba(0,0,0,0.15)] focus:outline-none disabled:bg-slate-100 disabled:text-slate-400"
@@ -837,7 +1250,7 @@ function CreateInvoiceView({
                       title="F1 — הצג רשימת פריטים"
                       disabled={productsLocked}
                       onClick={() => setCodePickerIndex(i)}
-                      className="win-button px-1 text-base leading-none disabled:cursor-not-allowed disabled:opacity-50"
+                      className="win-button h-6 px-1 py-0 text-base leading-none disabled:cursor-not-allowed disabled:opacity-50"
                     >
                       F1
                     </button>
@@ -860,16 +1273,18 @@ function CreateInvoiceView({
                     value={line.amount}
                     disabled={productsLocked}
                     onChange={(e) => updateLine(i, { amount: e.target.value })}
+                    onKeyDown={focusNextField}
                     className="h-6 w-16 border border-slate-400 bg-white px-1 shadow-[inset_1px_1px_2px_rgba(0,0,0,0.15)] focus:outline-none disabled:bg-slate-100 disabled:text-slate-400"
                   />
                 </td>
                 <td className="px-2 py-1">
                   <input
                     type="text"
-                    placeholder={item?.Price1 != null ? String(item.Price1) : ''}
+                    placeholder={item ? String(priceListFullTotal(item)) : ''}
                     value={line.unitPrice}
                     disabled={productsLocked}
                     onChange={(e) => updateLine(i, { unitPrice: e.target.value })}
+                    onKeyDown={focusNextField}
                     className="h-6 w-24 border border-slate-400 bg-white px-1 shadow-[inset_1px_1px_2px_rgba(0,0,0,0.15)] focus:outline-none disabled:bg-slate-100 disabled:text-slate-400"
                   />
                 </td>
@@ -882,6 +1297,7 @@ function CreateInvoiceView({
                       placeholder="1-18"
                       value={line.addMonths}
                       onChange={(e) => updateLine(i, { addMonths: e.target.value })}
+                      onKeyDown={focusNextField}
                       className="h-6 w-16 border border-amber-500 bg-amber-50 px-1 shadow-[inset_1px_1px_2px_rgba(0,0,0,0.15)] focus:outline-none"
                     />
                   ) : item?.add_service ? (
@@ -891,11 +1307,22 @@ function CreateInvoiceView({
                   )}
                 </td>
                 <td className="px-2 py-1">
-                  {lines.length > 1 && (
-                    <button type="button" onClick={() => removeLine(i)} className="text-lg text-red-700 underline">
-                      הסר
-                    </button>
-                  )}
+                  {/*
+                    Always shown — previously hidden whenever lines.length===1,
+                    which meant a product picked into the invoice's one and
+                    only (default) line could never be undone (reported
+                    2026-08-19: "impossible to delete the line"). A line-item
+                    invoice still needs at least one row, so removing the
+                    LAST one just clears it back to blank instead of
+                    dropping the row entirely.
+                  */}
+                  <button
+                    type="button"
+                    onClick={() => (lines.length > 1 ? removeLine(i) : setLines([emptyLine()]))}
+                    className="text-lg text-red-700 underline"
+                  >
+                    הסר
+                  </button>
                 </td>
               </tr>
             )
@@ -996,7 +1423,7 @@ function CreateInvoiceView({
                           amountTouched: true,
                         })
                       }
-                      className="win-button px-1 text-base leading-none"
+                      className="win-button h-6 px-1 py-0 text-base leading-none"
                     >
                       יתרה
                     </button>
@@ -1006,38 +1433,56 @@ function CreateInvoiceView({
               {p.method === 'check' && (
                 <>
                   <div>
+                    {/* MaxLength=8 on txtCheckNr in frmInvRec.frm */}
                     <label className="block text-[17px] text-slate-600">מס' שיק</label>
                     <input
                       type="text"
+                      inputMode="numeric"
+                      maxLength={8}
                       value={p.checkNr}
-                      onChange={(e) => updatePayment(i, { checkNr: e.target.value })}
+                      onChange={(e) => updatePayment(i, { checkNr: onlyDigits(e.target.value, 8) })}
+                      onBlur={() => cascadeCheckDetailsFromFirst(i)}
                       className="h-6 w-20 border border-slate-400 bg-white px-1 shadow-[inset_1px_1px_2px_rgba(0,0,0,0.15)] focus:outline-none"
                     />
                   </div>
                   <div>
-                    <label className="block text-[17px] text-slate-600">בנק</label>
+                    {/* MaxLength=2 on txtBankNr in frmInvRec.frm */}
+                    <label className="block text-[17px] text-slate-600">
+                      בנק{p.bankNr ? ` — ${bankName(p.bankNr) || '?'}` : ''}
+                    </label>
                     <input
                       type="text"
+                      inputMode="numeric"
+                      maxLength={2}
                       value={p.bankNr}
-                      onChange={(e) => updatePayment(i, { bankNr: e.target.value })}
+                      onChange={(e) => updatePayment(i, { bankNr: onlyDigits(e.target.value, 2) })}
+                      onBlur={() => cascadeCheckDetailsFromFirst(i)}
                       className="h-6 w-16 border border-slate-400 bg-white px-1 shadow-[inset_1px_1px_2px_rgba(0,0,0,0.15)] focus:outline-none"
                     />
                   </div>
                   <div>
+                    {/* MaxLength=3 on txtSnif in frmInvRec.frm */}
                     <label className="block text-[17px] text-slate-600">סניף</label>
                     <input
                       type="text"
+                      inputMode="numeric"
+                      maxLength={3}
                       value={p.snifNr}
-                      onChange={(e) => updatePayment(i, { snifNr: e.target.value })}
+                      onChange={(e) => updatePayment(i, { snifNr: onlyDigits(e.target.value, 3) })}
+                      onBlur={() => cascadeCheckDetailsFromFirst(i)}
                       className="h-6 w-16 border border-slate-400 bg-white px-1 shadow-[inset_1px_1px_2px_rgba(0,0,0,0.15)] focus:outline-none"
                     />
                   </div>
                   <div>
+                    {/* MaxLength=6 on txtAccountNr in frmInvRec.frm */}
                     <label className="block text-[17px] text-slate-600">מס' חשבון</label>
                     <input
                       type="text"
+                      inputMode="numeric"
+                      maxLength={6}
                       value={p.accountNr}
-                      onChange={(e) => updatePayment(i, { accountNr: e.target.value })}
+                      onChange={(e) => updatePayment(i, { accountNr: onlyDigits(e.target.value, 6) })}
+                      onBlur={() => cascadeCheckDetailsFromFirst(i)}
                       className="h-6 w-20 border border-slate-400 bg-white px-1 shadow-[inset_1px_1px_2px_rgba(0,0,0,0.15)] focus:outline-none"
                     />
                   </div>
@@ -1127,7 +1572,7 @@ function CreateInvoiceView({
                 const p = pendingSubmit
                 setExtendServiceConfirm(null)
                 setPendingSubmit(null)
-                void submitInvoice(p.invoiceLines, p.invoicePayments, p.buyer, p.recNr, 'confirm')
+                void submitInvoice(p.invoiceLines, p.invoicePayments, p.buyer, p.recNr, 'confirm', p.paidByTaxiNr, p.creditedInvNr)
               }}
               className="win-button"
             >
@@ -1140,7 +1585,7 @@ function CreateInvoiceView({
                 const p = pendingSubmit
                 setExtendServiceConfirm(null)
                 setPendingSubmit(null)
-                void submitInvoice(p.invoiceLines, p.invoicePayments, p.buyer, p.recNr, 'decline')
+                void submitInvoice(p.invoiceLines, p.invoicePayments, p.buyer, p.recNr, 'decline', p.paidByTaxiNr, p.creditedInvNr)
               }}
               className="win-button"
             >
@@ -1230,12 +1675,47 @@ function ListView({
 function DetailView({ taxiNr, invNr, onBack }: { taxiNr: number; invNr: number; onBack: () => void }) {
   const [invoice, setInvoice] = useState<InvoiceDetail | null>(null)
   const [error, setError] = useState<string | null>(null)
+  // Whether the local Crystal Reports print bridge (WebCode/print-bridge/)
+  // is running on THIS branch PC — only offer the "real" Crystal print
+  // buttons when it actually answers, otherwise fall back silently to the
+  // built-in PDF button below (no dead/broken buttons on branches that
+  // haven't set the bridge up yet).
+  const [bridgeAvailable, setBridgeAvailable] = useState(false)
 
   useEffect(() => {
     fetchInvoice(taxiNr, invNr)
       .then(setInvoice)
       .catch(() => setError('Failed to load invoice'))
   }, [taxiNr, invNr])
+
+  useEffect(() => {
+    isPrintBridgeAvailable().then(setBridgeAvailable)
+  }, [])
+
+  const [printing, setPrinting] = useState(false)
+
+  // Single print button: never-printed-before -> מקור, everything else
+  // (reprints, viewing an old invoice from history, etc.) -> העתק. Source of
+  // truth is Invoice.Printed, marked via mark-printed BEFORE opening the
+  // print view/bridge (so it reads the pre-print value) — see api/invoices.ts.
+  async function handlePrint() {
+    if (!invoice) return
+    setPrinting(true)
+    try {
+      const { wasAlreadyPrinted } = await markInvoicePrinted(taxiNr, invNr)
+      const isOriginal = !wasAlreadyPrinted
+      setInvoice((prev) => (prev ? { ...prev, Printed: true } : prev))
+      if (bridgeAvailable) {
+        window.open(invoicePrintUrl(invoice, isOriginal), '_blank')
+      } else {
+        window.open(`/api/account/${taxiNr}/invoices/${invNr}/print?copy=${isOriginal ? 1 : 0}`, '_blank')
+      }
+    } catch {
+      setError('שגיאה בהדפסה')
+    } finally {
+      setPrinting(false)
+    }
+  }
 
   return (
     <div>
@@ -1247,7 +1727,9 @@ function DetailView({ taxiNr, invNr, onBack }: { taxiNr: number; invNr: number; 
         <div className="flex gap-2">
           <button
             type="button"
-            onClick={() => window.open(`/api/account/${taxiNr}/invoices/${invNr}/print`, '_blank')}
+            title={bridgeAvailable ? 'הדפסה דרך Crystal Reports' : 'PDF פשוט (לא Crystal Reports)'}
+            disabled={!invoice || printing}
+            onClick={() => void handlePrint()}
             className="win-button px-2 py-0.5 text-lg"
           >
             הדפס
@@ -1355,6 +1837,7 @@ function DetailView({ taxiNr, invNr, onBack }: { taxiNr: number; invNr: number; 
                               p.checkNr != null ? `מס' ${p.checkNr}` : null,
                               p.bankNr != null ? `בנק ${p.bankNr}` : null,
                               p.snifNr != null ? `סניף ${p.snifNr}` : null,
+                              p.accountNr != null ? `חשבון ${p.accountNr}` : null,
                               p.checkDate ?? null,
                             ]
                               .filter(Boolean)

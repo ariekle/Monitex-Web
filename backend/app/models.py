@@ -211,16 +211,31 @@ class Action(Base):
 class Area(Base):
     """
     Areas lookup table — maps Account.Area/History.Area codes to branch/city
-    names (e.g. area 0 = "תל אביב"). Schema confirmed; only `area` (join key)
-    and `name` (nchar(10), space-padded) are relevant here — the rest of the
-    row is legacy per-branch config (paths, printer/bank settings, a login)
-    not needed for display.
+    names (e.g. area 0 = "תל אביב"). Schema confirmed; `area` (join key),
+    `name` (nchar(10), space-padded), and `PrintTestNr` are the only columns
+    used here — the rest of the row is legacy per-branch config (paths,
+    printer/bank settings, a login) not needed.
+
+    PrintTestNr: per-branch flag read in Account.frm's Form_Load
+    (`PrintTestNr = AreaRec.Recordset![PrintTestNr]`) and used only in
+    frmTestPrint.frm — when True, the test certificate's `testNr` parameter
+    gets the real (and always-incrementing) CFG.testNr value; when False, it
+    gets a static 0 instead. CFG.testNr itself increments every time
+    regardless of this flag — see routers/test_print.py.
+
+    BaseDir: per-branch local filesystem path (frmReset1.frm ~line 1416-1421:
+    `Trim(AreaRec.Recordset![BaseDir]) & Format(Area, "00#") & "\movein.dat"`)
+    -- where a brand-NEW reset's movein.dat gets written (ResetNr=0 path).
+    Used by routers/reset.py's commit_reset() -- see movein_export.py's
+    module docstring for the resend-path equivalent (CFG.hdir).
     """
 
     __tablename__ = "Areas"
 
     area = Column(SmallInteger, primary_key=True)
     name = Column(String(10))
+    PrintTestNr = Column("PrintTestNr", Boolean)
+    BaseDir = Column("BaseDir", String(255))
 
 
 class Invoice(Base):
@@ -390,10 +405,16 @@ class PriceListItem(Base):
     """
     PriceList table — line-item catalog for invoices. Schema confirmed.
 
-    Price1..Price6 — NOT yet confirmed which column corresponds to which
-    Area/branch. Phase 1 defaults to Price1 and leaves UnitPrice editable in
-    the create-invoice UI so it can be corrected manually; do not assume
-    Price1 is always right without checking against a known-good invoice.
+    Price1..Price6 — confirmed 2026-08-19: NOT per-Area/branch variants (an
+    earlier assumption here, now known wrong). An item priced across more
+    than one of these columns is one that gets paid off in that many
+    separate payments — Price1 is the first payment's own amount, Price2 the
+    second's, etc. (not an equal split of the total). The invoice LINE
+    itself is still billed for the item's full combined price (sum of all
+    non-zero columns) — see ActivateLine() in frmInvRec.frm and
+    create_invoice()'s unit_price default. The per-column split only drives
+    how many payments get auto-generated and each one's amount — see
+    InvoiceModal.tsx's priceListInstallments()/derivedInstallments.
 
     Prices are VAT-INCLUSIVE (gross/payable amounts) — confirmed via
     totalInvoice() in frmInvRec.frm, which treats the summed line total as
@@ -468,8 +489,15 @@ class Cfg(Base):
     requires *some* column to be marked as one — it is NOT confirmed to
     actually be a unique/primary column in the real table. Always query this
     with `.first()` (there's normally exactly one row), never `.get(Cfg, id)`.
-    `baseDir`/`hdir`/`happ` (legacy file paths) are known to exist too but
-    omitted here since nothing here needs them.
+    `happ` (legacy file path) is known to exist too but omitted here since
+    nothing here needs it.
+
+    hdir: the resend-to-Hashavshevet movein.dat destination directory
+    (frmReset1.frm ~line 1427-1428: `Trim(cfgRec.Recordset![hdir]) &
+    "\movein.dat"`) — used only for ResetNr<>0 (resend/reprint an archived
+    reset), NOT for a brand-new reset (that's Area.BaseDir instead, per
+    branch). See movein_export.py's module docstring and
+    routers/reset.py's download_movein_dat().
     """
 
     __tablename__ = "CFG"
@@ -480,3 +508,426 @@ class Cfg(Base):
     minimumCharge = Column(Numeric)
     msg_year = Column(Integer)
     testNr = Column(Integer)
+    hdir = Column("hdir", String(255))
+
+
+class Check(Base):
+    """
+    Checks table — one row per PHYSICAL check received as payment on a
+    HESHBONIT_KABALA(0) or KABALA(2) invoice, written alongside (duplicating)
+    the same data already stored inline on the Invoice row's PaymentTypeN/
+    CheckNrN/... slots. Confirmed via SaveChecks() in frmInvRec.frm:
+
+        frmMain.CheckRec.Recordset.AddNew
+        frmMain.CheckRec.Recordset![CheckNr] = CLng(txtCheckNr(i))
+        frmMain.CheckRec.Recordset![accountnr] = CLng(txtAccountNr(i))
+        frmMain.CheckRec.Recordset![snifnr] = CLng(txtSnif(i))
+        frmMain.CheckRec.Recordset![bankNr] = CInt(txtBankNr(i))
+        frmMain.CheckRec.Recordset![invnr] = InvRec.Recordset![invnr]
+        frmMain.CheckRec.Recordset![money] = val(txtSubTotalRec(i))
+        frmMain.CheckRec.Recordset![duedate] = txtDate(i)
+        frmMain.CheckRec.Recordset![ResetNr] = 0
+        frmMain.CheckRec.Recordset![Area] = Area   ' the BRANCH's Area, see routers/invoices.py
+        frmMain.CheckRec.Recordset![badCheck] = False
+
+    Before saving, SaveChecks() rejects a check that already exists
+    ("!!!השק כבר נמצא במאגר" — this check is already on file) via a
+    CheckCheck() lookup — reproduced as a uniqueness check in
+    routers/invoices.py._save_checks(). CONFIRMED 2026-08-19 (checked
+    directly against frmInvRec.frm's CheckCheck(), not assumed): the
+    duplicate check is NOT on CheckNr alone —
+
+        CheckRec.RecordSource = "select * from Checks where CheckNr=" & ... & _
+                                " and AccountNr=" & ... & _
+                                " and snifnr=" & ... & _
+                                " and bankNr=" & ...
+
+    — all four of CheckNr+AccountNr+SnifNr+BankNr together. A check number
+    is only unique within one bank account, not globally — two different
+    customers' checks can legitimately share a CheckNr as long as the
+    bank/branch/account differ. _save_checks() previously only compared
+    CheckNr (a leftover Phase-1 shortcut, before this was checked against
+    the source) — fixed to match all four fields.
+
+    UNCONFIRMED: exact column types/widths (no INFORMATION_SCHEMA dump
+    available for this table) — reconstructed purely from the VB6 usage
+    above. Modeled with a composite primary key across all four fields
+    CheckCheck() treats as the real uniqueness key (CheckNr+AccountNr+
+    SnifNr+BankNr — see above), now that _apply_payments() requires all four
+    together for any check payment (so none of them can legitimately be
+    null here). Purely an ORM-metadata decision — this app never runs
+    `create_all()` against the real production connection, so this does NOT
+    issue any DDL/constraint change against the actual SQL Server table;
+    it only fixes how SQLAlchemy's own identity map treats two Check rows
+    that happen to share a CheckNr but differ on the other three fields
+    (previously, with CheckNr alone as the PK, SQLAlchemy's own object
+    identity — separately from whatever the real table enforces — could
+    conflate two genuinely different checks). If the real table's actual
+    key is something else entirely (e.g. a separate identity column), this
+    will need adjusting.
+
+    badCheck flips True via the separate "Returned Checks" flow
+    (frmBackCheck.frm / cmdCheck_Click) — not yet ported to this app.
+    """
+
+    __tablename__ = "Checks"
+
+    CheckNr = Column(BigInteger, primary_key=True, autoincrement=False)
+    AccountNr = Column("accountnr", BigInteger, primary_key=True)
+    SnifNr = Column("snifnr", Integer, primary_key=True)
+    BankNr = Column("bankNr", SmallInteger, primary_key=True)
+    InvNr = Column("invnr", Integer)
+    Money = Column("money", Float)
+    DueDate = Column("duedate", String(10))  # "dd/mm/yyyy", matching CheckDateN on Invoices
+    ResetNr = Column("ResetNr", Integer)
+    Area = Column("Area", SmallInteger)
+    BadCheck = Column("badCheck", Boolean)
+
+
+# Column list shared by ActiveReset (one live row per Area, overwritten on
+# every reset) and Resets (append-only historical archive, one row per
+# completed reset) — both confirmed via the field-by-field writes at the end
+# of Reset() in Code VB6/frmReset1.frm (the form actually in Monitex2000.vbp;
+# frmReset.frm is an earlier unused prototype, same pattern as frmMain.frm).
+#
+# NOT ported (dead/vestigial in the live app, confirmed by reading the
+# Reset() source — the multi-company credit-card routing and the deposit-date
+# bank/company bucketing below it are entirely commented out, so every
+# credit-card payment collapses into ONE bucket regardless of card company):
+#   - CreditIsraN/P, CreditDinersN/P, CreditAmexN/P — always 0 in the live
+#     app; only CreditVisaN/P (the "N"=regular+credit-now, "P"=installments
+#     bucket) is ever actually populated. Modeled anyway for schema fidelity
+#     but routers/reset.py never writes to the Isra/Diners/Amex columns.
+#   - Per-deposit-slip check batching (CashChecks1-10/DelayedChecksList1-10,
+#     grouped in batches of 7/15 purely for a paper deposit-slip print run —
+#     see ActiveReset's own docstring) — the TRUE batch split isn't modeled;
+#     routers/reset.py reports one combined cash-checks total and one
+#     combined delayed-checks total on screen (more useful there than
+#     paginated print batches), and writes that combined total into slot 1
+#     of these columns (zeroing slots 2-10) purely so the Crystal print
+#     report — which reads these columns directly — doesn't show blank
+#     check totals.
+class ActiveReset(Base):
+    """
+    ActiveReset table — ONE staging row per Area/branch, overwritten every
+    time that branch runs a reset preview/commit (`select * from ActiveReset
+    where Area=...` then AddNew-if-missing else update in place). Holds the
+    same totals as Resets (see that model) for whichever reset is currently
+    in progress there. CONFIRMED against a real INFORMATION_SCHEMA.COLUMNS
+    dump of taxidb (2026-08-17) — column set below is the real one (ResetNr
+    NOT NULL, everything else nullable; no column is actually flagged
+    PRIMARY KEY in the dump, `Area` is used as one here purely so the ORM has
+    something to `.get()` by, matching the original's own `where Area=...`
+    lookup pattern).
+
+    `CashChecks1`..`CashChecks10` / `DelayedChecksList1`..`DelayedChecksList10`
+    (`DelayedChecksList` with no number also exists but nothing in
+    frmReset1.frm ever writes to it — legacy/unused, not mapped here) are the
+    original's per-deposit-slip check batching: `Reset()` in frmReset1.frm
+    splits the checks-to-deposit list into slip-sized batches (7 cash checks
+    or 15 delayed checks per physical bank form,
+    `deposit_blank_nr = ... + cash_check_nr \\ 7 + delayed_check_nr \\ 15`)
+    and writes each batch's own sub-total into its own numbered slot. This
+    app deliberately does NOT reproduce that batching (see module docstring
+    in routers/reset.py) — but leaving all 10 slots NULL meant the printed
+    report showed blank check totals entirely, since Crystal reads these
+    columns directly. commit_reset() now writes the FULL combined total into
+    slot 1 and explicitly zeroes slots 2-10 (matching what the original's own
+    Double array would naturally hold when there just aren't enough checks to
+    fill more than one batch) — not a faithful reproduction of the real
+    per-slip split, but the totals are correct and nothing prints empty.
+    `deposit_blank_nr` (a running count of blank deposit slips used) is left
+    unmapped/unwritten — purely a paper-forms counter tied to the same
+    batching this app doesn't do.
+    """
+
+    __tablename__ = "ActiveReset"
+
+    Area = Column(SmallInteger, primary_key=True, autoincrement=False)
+    ResetNr = Column(Integer)
+    DepoBank = Column(SmallInteger)
+    ResetDate = Column("resetDate", Date)
+    DepositDate = Column(Date)
+    InvRecs = Column("InvRecs", Integer)
+    TotalInvRecs = Column(Float)
+    Invoices = Column("invoices", Integer)
+    TotalInvoices = Column(Float)
+    Recs = Column("Recs", Integer)
+    TotalRecs = Column(Float)
+    Iskas = Column("Iskas", Integer)
+    TotalIskas = Column(Float)
+    Credits = Column("credits", Integer)
+    TotalCredits = Column("totalcredits", Float)
+    TotalKupa = Column("totalkupa", Float)
+    TotalVat = Column(Float)
+    CashDepo = Column("cashdepo", Float)
+    CashChecksNr = Column("cash_checks", Integer)
+    DelayedChecksNr = Column("delayed_checks", Integer)
+    CashChecks1 = Column(Float)
+    CashChecks2 = Column(Float)
+    CashChecks3 = Column(Float)
+    CashChecks4 = Column(Float)
+    CashChecks5 = Column(Float)
+    CashChecks6 = Column(Float)
+    CashChecks7 = Column(Float)
+    CashChecks8 = Column(Float)
+    CashChecks9 = Column(Float)
+    CashChecks10 = Column(Float)
+    DelayedChecksList1 = Column(Float)
+    DelayedChecksList2 = Column(Float)
+    DelayedChecksList3 = Column(Float)
+    DelayedChecksList4 = Column(Float)
+    DelayedChecksList5 = Column(Float)
+    DelayedChecksList6 = Column(Float)
+    DelayedChecksList7 = Column(Float)
+    DelayedChecksList8 = Column(Float)
+    DelayedChecksList9 = Column(Float)
+    DelayedChecksList10 = Column(Float)
+    CreditVisaN = Column(Float)
+    CreditVisaP = Column(Float)
+    CreditIsraN = Column(Float)
+    CreditIsraP = Column(Float)
+    CreditDinersN = Column(Float)
+    CreditDinersP = Column(Float)
+    CreditAmexN = Column(Float)
+    CreditAmexP = Column(Float)
+    TotalDepo = Column(Float)
+    BackChecksNr = Column("back_checks", Integer)
+    TotBackChecks = Column("tot_back_checks", Float)
+    ChecksPaidNr = Column("checks_paid", Integer)
+    TotChecksPaid = Column("tot_checks_paid", Float)
+
+
+class BadChecks(Base):
+    """
+    BadChecks table — one row per physical check reported as bounced/
+    returned by the bank, from the "שיקים חוזרים" (returned checks) flow —
+    Code/frmBackCheck.frm. CONFIRMED against a real INFORMATION_SCHEMA.COLUMNS
+    dump of taxidb (2026-08-17) — the table already existed in the restored
+    production DB (this app didn't create it). Column set below is the real
+    one; a few surprises versus the original guess (kept for anyone
+    reconciling this against the .frm source):
+
+      - There is NO separate `FamilyName` column. `txtFamilyName` in the
+        .frm is bound to `DataField = "Name"` — the SAME physical column
+        used at report-time for the invoice buyer's name
+        (`![name] = Trim(InvRec.Recordset![name])`). It's one column serving
+        both roles (initial snapshot, later manually corrected) — modeled
+        here as a single `Name` attribute; routers/bad_checks.py treats the
+        API's "family_name" as writing to this same column.
+      - `Tel` (not `CellPhone`) is the real phone column — kept mapped to a
+        `CellPhone` Python attribute for API-surface continuity, but the SQL
+        column name really is `Tel`. Notably the original never auto-fills
+        it at report time (`'BadChecksRec.Recordset![tel] = ...` is
+        commented out in the .frm) — matches this app's report() too.
+      - `Remark1`..`Remark5` (not `Msg1`..`Msg5`) hold the follow-up note
+        text; `Date1`..`Date5` are the paired dates. A `Date6`/`Remark6`
+        pair also exists in the real table but has no bound control
+        anywhere in frmBackCheck.frm — legacy/unused 6th slot, not mapped
+        here.
+      - The reason/status/return-bank *text* the secretary actually sees
+        and edits live in `ReasonTxt`/`StatusTxt`/`ReturnBankTxt` (the ADO
+        DataField targets of txtReason/txtStatus/txtReturnBank) — mapped
+        here as `Reason`/`Statustxt`/`ReturnBankName`. The real table ALSO
+        has separate `Reason`/`Status` tinyint code columns, but nothing in
+        frmBackCheck.frm ever writes to them (only the *Txt siblings are
+        bound to controls) — left unmapped/always-NULL here, matching the
+        original's actual behavior.
+      - `MoneyT` (float) is a second, apparently unused money-ish column —
+        never referenced anywhere in frmBackCheck.frm (the real amount
+        column, actually read/written, is `Money`, SQL type `money`) — left
+        unmapped here too.
+      - `InvDate` is `char`, not a native date type (unlike `InvoiceDate`,
+        which genuinely is `date`) — stored as "dd/mm/yyyy" text like
+        `DueDate`, mapped as a string here, not `Date`.
+
+    Reporting a NEW bad check (find_Check(checkBy:=0) with a typed
+    CheckNr+AccountNr+SnifNr that must match an existing `Checks` row, which
+    must itself link to a real `Invoices` row and a real `Accounts` row):
+        BadChecksRec.Recordset.AddNew
+        ![CheckNr] = ChecksRec![CheckNr]           ' + AccountNr/SnifNr/BankNr/InvNr/Money copied from Checks
+        ![duedate] = Replace(ChecksRec![duedate], ".", "/")
+        ![checkduedate] = CDate(ChecksRec![duedate])
+        ![name]/![invdate]/![invoicedate]/![TaxiNr]/![town]/![street]/
+            ![homenr]/![tz]/![zipcode] = ...        ' snapshotted from Invoices
+        ![ReturnBank] = ChecksRec![bankNr]          ' initial guess, re-editable via lstSelBank
+        ![lost] = False : ![ResetNr] = 0 : ![paidCheck] = 0 : ![PaidOver] = 0
+    then the secretary fills in/corrects FamilyName/CellPhone/Street/HomeNr/
+    Town/ZipCode, Reason (lstSelReason), ReturnBank (lstSelBank, re-typed as
+    free text then collapsed to `bank` 0/1 on save — see below), Status
+    (lstStatus), and up to 5 dated follow-up notes (Date1..5/Msg1..5). On
+    save, `Accounts.checks` (already modeled as `Account.Checks`) is
+    incremented by 1 — a running count of this taxi's currently-outstanding
+    bad checks, decremented again on repay-in-full or write-off.
+
+    Handling an EXISTING bad check (found by CheckNr+AccountNr+SnifNr, by
+    Tz, or by TaxiNr — only surfaced while `paidCheck < money AND NOT lost`):
+    a running late fee is computed and shown (not stored) via
+    `debit() = DateDiff("m", duedate, Date()) * CFG.interest + CFG.minimumCharge`
+    (months since the check's own due date, not since it was reported) —
+    ported as `_bad_check_debit()` in routers/bad_checks.py. Saving can:
+      - do nothing but update notes/status (both amounts left at 0), or
+      - collect `txtPayCheck` (repaying the original check amount) as a
+        standalone קבלה (KABALA, IgnoreInReset=1 — exempt from reset's
+        strict "payments must reconcile" check and NOT counted in the
+        normal cash/check/credit breakdown, since this money is recovering
+        a PAST period's shortfall, not new period revenue), and/or
+      - collect `txtPayInt` (the late fee itself) as a חש/קבלה
+        (HESHBONIT_KABALA, IgnoreInReset=2 — counted as cash regardless of
+        actual payment type in reset's math, see routers/reset.py's
+        module docstring for the exact rule). The original bypasses the
+        normal PriceList entirely for this one line (SubTotal1/Money1 set
+        directly from txtPayInt, no Code1) — NOT reproduced that way here;
+        routers/bad_checks.py instead requires picking a real PriceList
+        line like any other invoice (recommend the office keep a dedicated
+        "ריבית שק חוזר" price-list code for this).
+      IgnoreInReset=1/2 only ever come from THIS flow (Main.bas's global
+      `IgnoreInReset`, transiently set around these two calls then reset to
+      0) — every other invoice in this app always gets IgnoreInReset=0.
+    `cmdLost_Click` (only when `paidCheck = 0 AND NOT lost`) sets
+    `lost=True`, `Statustxt="דווח כחוב אבוד"`, and decrements
+    `Accounts.checks` by 1 (floor 0) — a write-off, no further collection
+    attempts.
+
+    Reason/Bank/Status option lists (extracted from frmBackCheck.frx's
+    ListBox.List binary resource — hand-parsed length-prefixed cp1255
+    strings, cross-checked against cmdSave_Click's exact string comparisons
+    where visible in code):
+      - Reason (lstSelReason, 6): א.כ.מ / מוגבל / מעוקל / נ.ה.ב / התאמה / חתימה
+      - Bank (lstSelBank, 2 — matches `If txtReturnBank = "בנק הפועלים" Then
+        bank=0 Else bank=1` in cmdSave_Click exactly): בנק הפועלים / בנק דיסקונט
+      - Status (lstStatus, 7 confirmed + 1 unrecovered — likely an 8th
+        destination, byte-offset drift in the .frx parse): הועבר לחיפה /
+        הועבר לירושלים / הועבר לב"ש / הועבר לאילת / הועבר לנתניה /
+        הועבר לעו"ד 1 / הועבר לעו"ד 2 (+ ? — not exposed as a hard enum here,
+        Reason/ReturnBank/Statustxt are all just plain strings so an
+        unrecovered 8th option costs nothing).
+
+    Two separate bank-ish columns, kept distinct on purpose despite the
+    similar names — genuinely different fields in the original:
+      - `BankNr` — the ORIGINAL check's own issuing bank (from
+        `Checks.BankNr`), never edited after creation; `txtBankName`
+        displays `BankName(BadChecksRec![bankNr])`, read-only.
+      - `ReturnBank` — an int code, defaulted from BankNr at report-time,
+        re-derived back to display text via the same `BankName()` lookup
+        when reopening an existing row (`txtReturnBank = BankName(![ReturnBank])`).
+      - `Bank` — the simplified 0/1 flag actually written by cmdSave_Click
+        from whatever free text ended up in txtReturnBank at save time
+        (0="בנק הפועלים", 1=anything else) — a separate, later-derived flag,
+        not simply `ReturnBank` renamed.
+
+    `ResetNr` is stored (always 0, per `![ResetNr] = 0` at creation) but not
+    read anywhere in frmReset1.frm/routers/reset.py — this table isn't
+    swept into the reset flow itself, only the KABALA/HESHBONIT_KABALA rows
+    it can spin off are (via their own IgnoreInReset). Kept here for schema
+    completeness/future use, not wired into anything.
+    """
+
+    __tablename__ = "BadChecks"
+
+    BadCheckNr = Column(Integer, primary_key=True)  # confirmed NOT NULL PK; identity-ness unconfirmed but the .frm never sets it explicitly on AddNew, consistent with IDENTITY
+    CheckNr = Column(Integer)
+    AccountNr = Column(Integer)
+    SnifNr = Column(Integer)
+    BankNr = Column(SmallInteger)
+    ReturnBank = Column(SmallInteger)  # numeric bank code (BankName() lookup), defaulted from BankNr at report time
+    ReturnBankName = Column("ReturnBankTxt", String(16))  # free text actually shown/edited in txtReturnBank
+    Bank = Column(SmallInteger)  # simplified 0/1 flag written by cmdSave_Click's exact string compare
+    InvNr = Column(Integer)
+    Money = Column(Float)  # real SQL type is `money`; mapped as Float like every other amount column in this app
+    DueDate = Column(String(10))  # "dd/mm/yyyy" text, matches Checks.DueDate
+    CheckDueDate = Column(Date)
+    Name = Column(String(32))  # dual-purpose: invoice buyer name at report time, later the editable "family name" field (txtFamilyName's real DataField) — there is no separate FamilyName column
+    InvDate = Column(String(10))  # char in the real table, NOT a native date — "dd/mm/yyyy" text like DueDate
+    InvoiceDate = Column(Date)  # this one genuinely is a native `date` column
+    TaxiNr = Column(Integer)
+    Town = Column(String(16))
+    Street = Column(String(16))
+    HomeNr = Column(String(10))
+    Tz = Column(Integer)
+    ZipCode = Column(Integer)
+    CellPhone = Column("Tel", String(11))  # real column is `Tel`; never auto-filled at report time in the original either
+    Lost = Column(Boolean)
+    Statustxt = Column("StatusTxt", String(32))
+    Reason = Column("ReasonTxt", String(16))
+    ResetNr = Column(Integer)
+    PaidCheck = Column(Float)
+    PaidOver = Column(Float)
+    Date1 = Column(String(10))
+    Msg1 = Column("Remark1", String(64))
+    Date2 = Column(String(10))
+    Msg2 = Column("Remark2", String(64))
+    Date3 = Column(String(10))
+    Msg3 = Column("Remark3", String(64))
+    Date4 = Column(String(10))
+    Msg4 = Column("Remark4", String(64))
+    Date5 = Column(String(10))
+    Msg5 = Column("Remark5", String(64))
+
+
+class Reset(Base):
+    """
+    Resets table — append-only historical archive, one row per completed
+    reset (ResetNr comes from CFG.IbudNr, incremented after each use — see
+    routers/reset.py). `Processed` starts False, matching
+    `ResetRec.Recordset![Processed] = False` in Reset() — nothing in this
+    app flips it True yet (that happens in a downstream accounting-export
+    step in the original, not ported).
+    """
+
+    __tablename__ = "Resets"
+
+    ResetNr = Column(Integer, primary_key=True, autoincrement=False)
+    Processed = Column(Boolean)
+    Area = Column(SmallInteger)
+    DepoBank = Column(SmallInteger)
+    ResetDate = Column("resetDate", Date)
+    DepositDate = Column(Date)
+    InvRecs = Column("InvRecs", Integer)
+    TotalInvRecs = Column(Float)
+    Invoices = Column("invoices", Integer)
+    TotalInvoices = Column(Float)
+    Recs = Column("Recs", Integer)
+    TotalRecs = Column(Float)
+    Iskas = Column("Iskas", Integer)
+    TotalIskas = Column(Float)
+    Credits = Column("credits", Integer)
+    TotalCredits = Column("totalcredits", Float)
+    TotalKupa = Column("totalkupa", Float)
+    TotalVat = Column(Float)
+    CashDepo = Column("cashdepo", Float)
+    CashChecksNr = Column("cash_checks", Integer)
+    DelayedChecksNr = Column("delayed_checks", Integer)
+    CashChecks1 = Column(Float)
+    CashChecks2 = Column(Float)
+    CashChecks3 = Column(Float)
+    CashChecks4 = Column(Float)
+    CashChecks5 = Column(Float)
+    CashChecks6 = Column(Float)
+    CashChecks7 = Column(Float)
+    CashChecks8 = Column(Float)
+    CashChecks9 = Column(Float)
+    CashChecks10 = Column(Float)
+    DelayedChecksList1 = Column(Float)
+    DelayedChecksList2 = Column(Float)
+    DelayedChecksList3 = Column(Float)
+    DelayedChecksList4 = Column(Float)
+    DelayedChecksList5 = Column(Float)
+    DelayedChecksList6 = Column(Float)
+    DelayedChecksList7 = Column(Float)
+    DelayedChecksList8 = Column(Float)
+    DelayedChecksList9 = Column(Float)
+    DelayedChecksList10 = Column(Float)
+    CreditVisaN = Column(Float)
+    CreditVisaP = Column(Float)
+    CreditIsraN = Column(Float)
+    CreditIsraP = Column(Float)
+    CreditDinersN = Column(Float)
+    CreditDinersP = Column(Float)
+    CreditAmexN = Column(Float)
+    CreditAmexP = Column(Float)
+    TotalDepo = Column(Float)
+    BackChecksNr = Column("back_checks", Integer)
+    TotBackChecks = Column("tot_back_checks", Float)
+    ChecksPaidNr = Column("checks_paid", Integer)
+    TotChecksPaid = Column("tot_checks_paid", Float)

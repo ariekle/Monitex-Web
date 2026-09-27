@@ -1,16 +1,30 @@
-import { useEffect, useState, type KeyboardEvent } from 'react'
+import { Children, useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from 'react'
 import { useStatus } from '../context/StatusContext'
 import {
   fetchAccount,
+  fetchAccountByMeter,
   saveAccount,
+  searchAccountsByName,
   AccountNotFoundError,
   type Account,
   type AccountEditableFields,
+  type AccountSearchResult,
 } from '../api/account'
 import { formatDate, formatMonthYear } from '../utils/format'
+import BadChecksModal from '../components/BadChecksModal'
+import ExitConfirmModal from '../components/ExitConfirmModal'
+import ExpiryModal from '../components/ExpiryModal'
 import HistoryModal from '../components/HistoryModal'
 import InvoiceModal from '../components/InvoiceModal'
 import MeterActionsModal from '../components/MeterActionsModal'
+import ModemActionModal from '../components/ModemActionModal'
+import MsgModal from '../components/MsgModal'
+import ResetModal from '../components/ResetModal'
+import PastResetModal from '../components/PastResetModal'
+import SendToHashModal from '../components/SendToHashModal'
+import TestPrintModal from '../components/TestPrintModal'
+import monitexLogo from '../assets/monitex-logo.png'
+import { getStoredBranchArea, getStoredIsAccounting } from '../api/branch'
 
 /**
  * Web equivalent of Code/Account.frm — the real Monitex main screen (see the
@@ -154,7 +168,7 @@ function toEditableFields(account: Account): AccountEditableFields {
 /** Sunken-look read-only box — approximates the greyed-out Locked=True TextBox in the original. */
 function DisplayField({ label, value, className = '' }: { label: string; value: string; className?: string }) {
   return (
-    <label className={`flex items-center gap-1.5 text-[19px] text-slate-800 ${className}`}>
+    <label className={`flex items-center gap-1.5 text-[16px] text-slate-800 ${className}`}>
       <span className="whitespace-nowrap">{label}:</span>
       <input
         type="text"
@@ -183,7 +197,7 @@ function EditField({
   maxLength?: number
 }) {
   return (
-    <label className={`flex items-center gap-1.5 text-[19px] text-slate-800 ${className}`}>
+    <label className={`flex items-center gap-1.5 text-[16px] text-slate-800 ${className}`}>
       <span className="whitespace-nowrap">{label}:</span>
       <input
         type="text"
@@ -199,12 +213,55 @@ function EditField({
   )
 }
 
-/** Raised-look Win32 button. Sub-screens not built yet surface a note instead of doing nothing. */
-function StubButton({ label, onStub }: { label: string; onStub: (label: string) => void }) {
+/**
+ * Lays the command buttons out in one row when they fit, or splits them into
+ * two evenly-sized rows (rather than however plain `flex-wrap` happens to
+ * pack them, which can leave a single button stranded on its own line) when
+ * they don't. Measures the buttons' natural unwrapped width against the
+ * available container width to decide.
+ */
+function BalancedButtonRow({ children }: { children: ReactNode }) {
+  const containerRef = useRef<HTMLDivElement>(null)
+  const measureRef = useRef<HTMLDivElement>(null)
+  const [twoRows, setTwoRows] = useState(false)
+  const items = Children.toArray(children)
+
+  useEffect(() => {
+    function check() {
+      const container = containerRef.current
+      const measure = measureRef.current
+      if (!container || !measure) return
+      setTwoRows(measure.scrollWidth > container.clientWidth)
+    }
+    check()
+    window.addEventListener('resize', check)
+    const ro = new ResizeObserver(check)
+    if (containerRef.current) ro.observe(containerRef.current)
+    return () => {
+      window.removeEventListener('resize', check)
+      ro.disconnect()
+    }
+  }, [items.length])
+
+  const half = Math.ceil(items.length / 2)
+  const firstRow = items.slice(0, half)
+  const secondRow = items.slice(half)
+
   return (
-    <button type="button" onClick={() => onStub(label)} className="win-button">
-      {label}
-    </button>
+    <div ref={containerRef} className="relative w-full">
+      {/* Invisible, unconstrained (absolute, no-wrap) copy used only to measure the natural one-row width. */}
+      <div ref={measureRef} className="invisible absolute right-0 top-0 flex flex-nowrap gap-2" aria-hidden="true">
+        {items}
+      </div>
+      {twoRows ? (
+        <div className="flex flex-col gap-2">
+          <div className="flex flex-wrap justify-center gap-2">{firstRow}</div>
+          <div className="flex flex-wrap justify-center gap-2">{secondRow}</div>
+        </div>
+      ) : (
+        <div className="flex flex-nowrap gap-2">{items}</div>
+      )}
+    </div>
   )
 }
 
@@ -215,6 +272,24 @@ export default function AccountPage() {
   const [account, setAccount] = useState<Account | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  // Web equivalent of frmMsg.Show vbModal for the "not found" case — see
+  // handleLookup below and components/MsgModal.tsx.
+  const [notFoundMsg, setNotFoundMsg] = useState<string | null>(null)
+
+  // Web equivalent of FindMode + the txtTaxiNr -> txtMeterNr -> txtFamilyName
+  // Enter-key cascade in Account.frm's initTaxiWindow/txtMeterNr_KeyPress/
+  // txtFamilyName_KeyPress: pressing Enter on a blank taxi number hands focus
+  // to the meter-number box; Enter there with a value looks the account up
+  // by meter, blank hands focus to a family-name search box; Enter there
+  // runs a "LIKE 'name%'" search and shows a picklist (Names_DblClick).
+  const [findStage, setFindStage] = useState<'taxi' | 'meter' | 'name'>('taxi')
+  const [meterNrQuery, setMeterNrQuery] = useState('')
+  const [nameQuery, setNameQuery] = useState('')
+  const [nameResults, setNameResults] = useState<AccountSearchResult[] | null>(null)
+  const [nameSearching, setNameSearching] = useState(false)
+  const taxiNrInputRef = useRef<HTMLInputElement>(null)
+  const meterNrInputRef = useRef<HTMLInputElement>(null)
+  const nameInputRef = useRef<HTMLInputElement>(null)
 
   const [editMode, setEditMode] = useState(false)
   const [draft, setDraft] = useState<AccountEditableFields | null>(null)
@@ -224,20 +299,57 @@ export default function AccountPage() {
   const [showHistory, setShowHistory] = useState(false)
   const [invoiceModalMode, setInvoiceModalMode] = useState<'issue' | 'copy' | null>(null)
   const [showMeterActions, setShowMeterActions] = useState(false)
+  const [showBadChecks, setShowBadChecks] = useState(false)
+  const [showReset, setShowReset] = useState(false)
+  const [showPastReset, setShowPastReset] = useState(false)
+  const [showSendToHash, setShowSendToHash] = useState(false)
+  // "העברה לחשבשבת" is an accounting-PC-only feature in the original (see
+  // Account.frm's F11: `If Area = 0 Then frmSendtoHash.Show vbModal`). Read
+  // once on mount — this workstation's area/accounting flag don't change
+  // without an explicit "שנה סניף" (which reloads the whole gate) anyway.
+  const [canSendToHash] = useState(() => getStoredBranchArea() === 0 && getStoredIsAccounting())
+  const [showTestPrint, setShowTestPrint] = useState(false)
+  const [showExitConfirm, setShowExitConfirm] = useState(false)
+  const [showModemActions, setShowModemActions] = useState(false)
+  const [showExpiry, setShowExpiry] = useState(false)
 
   useEffect(() => {
     setStatus(account ? `Account ${account.TaxiNr}` : 'Account')
     return () => setStatus('Ready')
   }, [account, setStatus])
 
+  useEffect(() => {
+    if (findStage === 'taxi') taxiNrInputRef.current?.focus()
+    else if (findStage === 'meter') meterNrInputRef.current?.focus()
+    else if (findStage === 'name') nameInputRef.current?.focus()
+  }, [findStage])
+
   async function handleLookup(taxiNrText: string) {
-    const taxiNr = Number(taxiNrText)
+    const trimmed = taxiNrText.trim()
+    // Ported from initTaxiWindow's `Itaxinr = val(txtTaxiNr.Text) ... If Itaxinr = 0
+    // Then Call clearAccount ... FindMode = True ... txtMeterNr.SetFocus` —
+    // pressing Enter on a blank (or non-numeric) taxi number clears the
+    // screen AND hands focus to the meter-number box, starting the
+    // meter-nr -> family-name find-mode cascade.
+    if (trimmed === '' || Number(trimmed) === 0) {
+      setAccount(null)
+      setError(null)
+      setNotFoundMsg(null)
+      setEditMode(false)
+      setStubNote(null)
+      setFindStage('meter')
+      setMeterNrQuery('')
+      setNameResults(null)
+      return
+    }
+    const taxiNr = Number(trimmed)
     if (!Number.isInteger(taxiNr) || taxiNr <= 0) {
       setError('Enter a valid taxi number')
       return
     }
     setLoading(true)
     setError(null)
+    setNotFoundMsg(null)
     setEditMode(false)
     setStubNote(null)
     try {
@@ -245,9 +357,114 @@ export default function AccountPage() {
       setAccount(result)
     } catch (e) {
       setAccount(null)
-      setError(e instanceof AccountNotFoundError ? `No account for taxi ${taxiNr}` : 'Failed to load account')
+      if (e instanceof AccountNotFoundError) {
+        // The original's "not found" branch (initTaxiWindow's `Else ' not
+        // found/new`) actually opens frmCreateNew to offer creating a brand
+        // new account for that taxi number — that flow isn't built here yet,
+        // so this just shows a plain not-found popup instead.
+        setNotFoundMsg('!לקוח לא נמצא')
+      } else {
+        setError('Failed to load account')
+      }
     } finally {
       setLoading(false)
+    }
+  }
+
+  /** Web equivalent of the txtMeterNr FindMode Enter-key branch. */
+  async function handleMeterLookup() {
+    const trimmed = meterNrQuery.trim()
+    // Ported from txtMeterNr_KeyPress's else-branch: Enter on a blank/zero
+    // meter number unlocks and focuses txtFamilyName instead.
+    if (trimmed === '' || Number(trimmed) === 0) {
+      setFindStage('name')
+      setNameQuery('')
+      setNameResults(null)
+      return
+    }
+    const meterNr = Number(trimmed)
+    if (!Number.isInteger(meterNr) || meterNr <= 0) {
+      setError('Enter a valid meter number')
+      return
+    }
+    setLoading(true)
+    setError(null)
+    try {
+      const result = await fetchAccountByMeter(meterNr)
+      setAccount(result)
+      setTaxiNrQuery('')
+    } catch (e) {
+      setAccount(null)
+      setError(e instanceof AccountNotFoundError ? e.message : 'Failed to load account by meter')
+    } finally {
+      // Matches the original: FindMode is cleared and focus returns to
+      // txtTaxiNr regardless of whether the meter was found.
+      setFindStage('taxi')
+      setMeterNrQuery('')
+      setLoading(false)
+    }
+  }
+
+  /** Web equivalent of the txtFamilyName FindMode Enter-key branch (LIKE 'name%' search). */
+  async function handleNameSearch() {
+    const trimmed = nameQuery.trim()
+    if (trimmed === '') {
+      // The original falls through further to a CarNr search box on a
+      // second blank Enter — not ported here; simplified to just returning
+      // to normal taxi-nr entry.
+      setFindStage('taxi')
+      setNameResults(null)
+      return
+    }
+    setNameSearching(true)
+    setError(null)
+    try {
+      const results = await searchAccountsByName(trimmed)
+      setNameResults(results)
+    } catch {
+      setError('Failed to search by name')
+    } finally {
+      setNameSearching(false)
+    }
+  }
+
+  /** Web equivalent of Names_DblClick / Names_KeyPress+Enter — pick a match from the search list. */
+  async function selectNameResult(taxiNr: number) {
+    setFindStage('taxi')
+    setNameQuery('')
+    setNameResults(null)
+    setLoading(true)
+    setError(null)
+    setTaxiNrQuery('')
+    try {
+      const result = await fetchAccount(taxiNr)
+      setAccount(result)
+    } catch {
+      setAccount(null)
+      setError('Failed to load account')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  function handleMeterNrKeyDown(e: KeyboardEvent<HTMLInputElement>) {
+    if (e.key === 'Enter') {
+      e.preventDefault()
+      void handleMeterLookup()
+    } else if (e.key === 'Escape') {
+      setFindStage('taxi')
+      setMeterNrQuery('')
+    }
+  }
+
+  function handleNameQueryKeyDown(e: KeyboardEvent<HTMLInputElement>) {
+    if (e.key === 'Enter') {
+      e.preventDefault()
+      void handleNameSearch()
+    } else if (e.key === 'Escape') {
+      setFindStage('taxi')
+      setNameQuery('')
+      setNameResults(null)
     }
   }
 
@@ -319,41 +536,67 @@ export default function AccountPage() {
     <div dir="rtl" className="flex h-full flex-col bg-[#EFEDE6] p-4 text-right font-sans">
       {/* Title bar area, echoing the " מוניטקס" / version header of the original window */}
       <div className="mb-2 flex items-baseline justify-between border-b-2 border-yellow-400 pb-1.5">
-        <h1 className="text-[22px] font-bold text-slate-800">מוניטקס</h1>
-        <span className="text-lg text-slate-500">Ver 10.00</span>
+        <div className="flex items-center gap-2">
+          <img src={monitexLogo} alt="" className="h-7 w-7 object-contain" />
+          <h1 className="text-[19px] font-bold text-slate-800">מוניטקס</h1>
+        </div>
+        <span className="text-base text-slate-500">Ver 10.00</span>
       </div>
 
-      {error && <div className="mb-2 border border-red-300 bg-red-50 px-3 py-1.5 text-xl text-red-700">{error}</div>}
+      {error && <div className="mb-2 border border-red-300 bg-red-50 px-3 py-1.5 text-lg text-red-700">{error}</div>}
       {stubNote && (
-        <div className="mb-2 border border-amber-300 bg-amber-50 px-3 py-1.5 text-xl text-amber-800">
+        <div className="mb-2 border border-amber-300 bg-amber-50 px-3 py-1.5 text-lg text-amber-800">
           "{stubNote}" — this sub-screen isn't built yet.
         </div>
       )}
 
       <div className="space-y-2.5">
-        {/* Row 1: taxi nr / meter nr / expiry / insurance / meter status */}
-        <div className="grid grid-cols-5 gap-3">
-          <label className="flex items-center gap-2 text-[28px] font-bold text-slate-800">
+        {/* Row 1: taxi nr / meter nr / expiry / insurance / meter status.
+            Unequal column widths (not a plain grid-cols-5) because "תוקף שרות:"
+            plus its value ("MM/YYYY") at this row's large 28px font needs more
+            room than the others or the value gets clipped. */}
+        <div className="grid grid-cols-[1fr_0.85fr_1.35fr_0.75fr_0.85fr] gap-3">
+          <label className="flex items-center gap-2 text-[22px] font-bold text-slate-800">
             <span className="whitespace-nowrap">מס' מונית:</span>
             <input
+              ref={taxiNrInputRef}
               type="text"
               value={taxiNrQuery}
               onChange={(e) => setTaxiNrQuery(e.target.value)}
               onKeyDown={handleTaxiNrKeyDown}
-              disabled={loading}
-              className="h-10 w-full border border-sky-500 bg-white px-2 text-[28px] font-bold text-slate-900 shadow-[inset_1px_1px_2px_rgba(0,0,0,0.15)] focus:outline-none disabled:opacity-60"
+              disabled={loading || findStage !== 'taxi'}
+              maxLength={5}
+              className="h-9 w-full border border-sky-500 bg-white px-2 text-[22px] font-bold text-slate-900 shadow-[inset_1px_1px_2px_rgba(0,0,0,0.15)] focus:outline-none disabled:opacity-60"
               autoFocus
             />
-            {loading && <span className="text-lg font-normal text-slate-500">טוען...</span>}
+            {loading && <span className="text-base font-normal text-slate-500">טוען...</span>}
           </label>
-          <DisplayField label="מס' מונה" value={String(account?.MeterNr ?? '')} />
-          <label className="flex items-center gap-2 text-[28px] font-bold text-slate-800">
+          {/* Web equivalent of txtMeterNr toggling between a bound display
+              field (locked) and a search box (unlocked, FindMode=True) — see
+              handleLookup/handleMeterLookup above. */}
+          {findStage === 'meter' ? (
+            <label className="flex items-center gap-1.5 text-[16px] text-slate-800">
+              <span className="whitespace-nowrap">מס' מונה:</span>
+              <input
+                ref={meterNrInputRef}
+                type="text"
+                value={meterNrQuery}
+                onChange={(e) => setMeterNrQuery(e.target.value)}
+                onKeyDown={handleMeterNrKeyDown}
+                placeholder="חפש לפי מס' מונה, Enter ריק ⇠ חיפוש לפי שם"
+                className="h-6 w-full border border-sky-500 bg-white px-1.5 text-slate-900 shadow-[inset_1px_1px_2px_rgba(0,0,0,0.15)] focus:outline-none"
+              />
+            </label>
+          ) : (
+            <DisplayField label="מס' מונה" value={String(account?.MeterNr ?? '')} />
+          )}
+          <label className="flex items-center gap-2 text-[22px] font-bold text-slate-800">
             <span className="whitespace-nowrap">תוקף שרות:</span>
             <input
               type="text"
               value={formatMonthYear(account?.MeterExpDate ?? null)}
               readOnly
-              className="h-10 w-full border border-slate-400 bg-[#ECE9E4] px-2 text-[28px] font-bold text-slate-700 shadow-[inset_1px_1px_2px_rgba(0,0,0,0.15)] focus:outline-none"
+              className="h-9 w-full border border-slate-400 bg-[#ECE9E4] px-2 text-[22px] font-bold text-slate-700 shadow-[inset_1px_1px_2px_rgba(0,0,0,0.15)] focus:outline-none"
             />
           </label>
           {/* Meters.Insurance is INVERTED — confirmed via Account.frm's lblInsurance
@@ -370,13 +613,49 @@ export default function AccountPage() {
 
         {/* Row 2: names + cap status/model */}
         <div className="grid grid-cols-4 gap-3">
-          <EditField
-            label="שם משפחה"
-            value={editable ? draft!.FamilyName : account?.FamilyName ?? ''}
-            editable={editable}
-            onChange={(v) => updateDraftText('FamilyName', v)}
-            maxLength={12}
-          />
+          {findStage === 'name' ? (
+            <div className="relative">
+              <label className="flex items-center gap-1.5 text-[16px] text-slate-800">
+                <span className="whitespace-nowrap">שם משפחה:</span>
+                <input
+                  ref={nameInputRef}
+                  type="text"
+                  value={nameQuery}
+                  onChange={(e) => setNameQuery(e.target.value)}
+                  onKeyDown={handleNameQueryKeyDown}
+                  placeholder="חפש לפי שם משפחה, Enter לחיפוש"
+                  className="h-6 w-full border border-sky-500 bg-white px-1.5 text-slate-900 shadow-[inset_1px_1px_2px_rgba(0,0,0,0.15)] focus:outline-none"
+                />
+              </label>
+              {nameSearching && <div className="mt-0.5 text-base text-slate-500">מחפש...</div>}
+              {nameResults !== null && (
+                <div className="absolute z-10 mt-0.5 max-h-56 w-full overflow-auto border border-slate-400 bg-white text-base shadow-lg">
+                  {nameResults.length === 0 ? (
+                    <div className="px-2 py-1.5 text-slate-500">לא נמצאו התאמות</div>
+                  ) : (
+                    nameResults.map((r) => (
+                      <button
+                        key={r.TaxiNr}
+                        type="button"
+                        onClick={() => void selectNameResult(r.TaxiNr)}
+                        className="block w-full px-2 py-1.5 text-right hover:bg-sky-50"
+                      >
+                        {r.FamilyName} {r.PrivatName} — מונית {r.TaxiNr}
+                      </button>
+                    ))
+                  )}
+                </div>
+              )}
+            </div>
+          ) : (
+            <EditField
+              label="שם משפחה"
+              value={editable ? draft!.FamilyName : account?.FamilyName ?? ''}
+              editable={editable}
+              onChange={(v) => updateDraftText('FamilyName', v)}
+              maxLength={12}
+            />
+          )}
           <EditField
             label="שם פרטי"
             value={editable ? draft!.PrivatName : account?.PrivatName ?? ''}
@@ -438,8 +717,8 @@ export default function AccountPage() {
           <DisplayField label="סוג מונה" value={meterModelAndType(account?.MeterNr).type} />
         </div>
 
-        {/* Row 5: station / area */}
-        <div className="grid grid-cols-2 gap-3">
+        {/* Row 5: station / modem / area */}
+        <div className="grid grid-cols-3 gap-3">
           <EditField
             label="תחנה"
             value={editable ? draft!.Station : account?.Station ?? ''}
@@ -447,6 +726,11 @@ export default function AccountPage() {
             onChange={(v) => updateDraftText('Station', v)}
             maxLength={10}
           />
+          {/* Account.Modem reuses the same 1/2/3/4 status codes as Meter.Status
+              (see routers/meter_actions.py's modem_action docstring), so the
+              existing meterStatusLabel() lookup applies directly. Set via the
+              מסופון button below (ModemActionModal). */}
+          <DisplayField label="מסופון" value={meterStatusLabel(account?.Modem)} />
           {/* Joined from the real Areas DB lookup table (routers/account.py) —
               not hardcoded here, so the business can rename/add areas via the
               DB without a code change. */}
@@ -467,12 +751,12 @@ export default function AccountPage() {
       </div>
 
       <div className="mt-auto flex flex-col gap-2.5 border-t-2 border-yellow-400 pt-2.5">
-        <div className="text-lg text-slate-500">
+        <div className="text-base text-slate-500">
           סניף: תל אביב &nbsp;&nbsp; {new Date().toLocaleString('he-IL')}
         </div>
 
         {!editMode ? (
-          <div className="flex flex-wrap gap-2">
+          <BalancedButtonRow>
             <button
               type="button"
               disabled={!account}
@@ -497,7 +781,13 @@ export default function AccountPage() {
             >
               העתק חשבונית
             </button>
-            <StubButton label="שקים חוזרים" onStub={setStubNote} />
+            {/* cmdCheck in Account.frm -> frmBackCheck.Show — its own
+                independent search screen (by check nr, TZ, or taxi nr), not
+                scoped to whatever's currently loaded here, so — like the
+                original — this button is never disabled by `!account`. */}
+            <button type="button" onClick={() => setShowBadChecks(true)} className="win-button">
+              שקים חוזרים
+            </button>
             <button
               type="button"
               disabled={!account}
@@ -506,13 +796,69 @@ export default function AccountPage() {
             >
               פעולות במונה וכובע
             </button>
-            <StubButton label="מסופון" onStub={setStubNote} />
+            {/* printTest() in Account.frm — Alt+F1/Shift+F1 in the original,
+                no visible button there at all. Exposed here as a normal
+                button since it's an official document (meter test
+                certificate) drivers present to the licensing authority. */}
+            <button
+              type="button"
+              disabled={!account}
+              onClick={() => setShowTestPrint(true)}
+              className="win-button disabled:opacity-50"
+            >
+              אישור בדיקת מונה
+            </button>
+            {/* cmdReset in Account.frm — branch-wide, NOT scoped to the
+                currently-looked-up taxi (frmReset.Show vbModal doesn't touch
+                txtTaxiNr at all), so unlike the other buttons here this one
+                is never disabled by `!account`. */}
+            <button type="button" onClick={() => setShowReset(true)} className="win-button">
+              איפוס
+            </button>
+            {/* Ported from Account.frm's Alt+F5 shortcut (txtTaxiNr_KeyDown)
+                — lookup/reprint a PAST reset by reset-nr or date+area. Also
+                branch-wide, not scoped to the current taxi, like cmdReset
+                above. Exposed as a visible button rather than a hidden
+                keyboard shortcut, since the original's Alt+F5 had no menu
+                entry point and was effectively undiscoverable. */}
+            <button type="button" onClick={() => setShowPastReset(true)} className="win-button">
+              חיפוש איפוס קודם
+            </button>
+            {/* frmSendtoHash.frm — real, compiled part of Monitex2000.vbp
+                (confirmed 2026-09-27, not a dead prototype). Unlike the two
+                buttons above, the original gated this to the accounting PC
+                only (Account.frm's hidden F11 shortcut, `If Area = 0`) — so
+                here it's only rendered when this workstation is both Area=0
+                AND explicitly flagged as the accounting seat (see
+                BranchAreaGate.tsx / api/branch.ts, 2026-09-27). */}
+            {canSendToHash && (
+              <button type="button" onClick={() => setShowSendToHash(true)} className="win-button">
+                העברה לחשבשבת
+              </button>
+            )}
+            <button
+              type="button"
+              disabled={!account}
+              onClick={() => setShowModemActions(true)}
+              className="win-button disabled:opacity-50"
+            >
+              מסופון
+            </button>
             <button type="button" disabled={!account} onClick={startEdit} className="win-button disabled:opacity-50">
               עדכון פרטים
             </button>
-            <StubButton label="תוקף" onStub={setStubNote} />
-            <StubButton label="יציאה" onStub={setStubNote} />
-          </div>
+            <button
+              type="button"
+              disabled={!account}
+              onClick={() => setShowExpiry(true)}
+              className="win-button disabled:opacity-50"
+            >
+              תוקף
+            </button>
+            <button type="button" onClick={() => setShowExitConfirm(true)} className="win-button">
+              יציאה
+            </button>
+          </BalancedButtonRow>
         ) : (
           <div className="flex gap-2">
             <button
@@ -530,6 +876,30 @@ export default function AccountPage() {
         )}
       </div>
 
+      {notFoundMsg && <MsgModal message={notFoundMsg} onClose={() => setNotFoundMsg(null)} />}
+      {showExitConfirm && <ExitConfirmModal onClose={() => setShowExitConfirm(false)} />}
+
+      {showModemActions && account && (
+        <ModemActionModal
+          taxiNr={account.TaxiNr}
+          currentModem={account.Modem}
+          onClose={() => {
+            setShowModemActions(false)
+            void refreshAccount()
+          }}
+        />
+      )}
+
+      {showExpiry && account && (
+        <ExpiryModal
+          taxiNr={account.TaxiNr}
+          onClose={() => {
+            setShowExpiry(false)
+            void refreshAccount()
+          }}
+        />
+      )}
+
       {showHistory && account && (
         <HistoryModal taxiNr={account.TaxiNr} onClose={() => setShowHistory(false)} />
       )}
@@ -539,7 +909,15 @@ export default function AccountPage() {
           taxiNr={account.TaxiNr}
           mode={invoiceModalMode}
           defaultBuyerName={`${account.FamilyName ?? ''} ${account.PrivatName ?? ''}`.trim()}
-          onClose={() => setInvoiceModalMode(null)}
+          onClose={() => {
+            setInvoiceModalMode(null)
+            // Issuing an invoice can extend/shorten the meter's service expiry
+            // and flip insurance (see routers/invoices.py's service/insurance
+            // side-effects) — refresh so this screen doesn't keep showing a
+            // stale ExpDate/Insurance after the modal closes. Same pattern as
+            // MeterActionsModal's onClose below.
+            void refreshAccount()
+          }}
         />
       )}
 
@@ -552,6 +930,18 @@ export default function AccountPage() {
             void refreshAccount()
           }}
         />
+      )}
+
+      {showReset && <ResetModal onClose={() => setShowReset(false)} />}
+      {showPastReset && <PastResetModal onClose={() => setShowPastReset(false)} />}
+      {canSendToHash && showSendToHash && <SendToHashModal onClose={() => setShowSendToHash(false)} />}
+
+      {showTestPrint && account && (
+        <TestPrintModal taxiNr={account.TaxiNr} onClose={() => setShowTestPrint(false)} />
+      )}
+
+      {showBadChecks && (
+        <BadChecksModal defaultTaxiNr={account?.TaxiNr} onClose={() => setShowBadChecks(false)} />
       )}
     </div>
   )

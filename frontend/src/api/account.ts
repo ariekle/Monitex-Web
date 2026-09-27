@@ -65,6 +65,12 @@ export interface AccountEditableFields {
   Msg: string
 }
 
+export interface AccountSearchResult {
+  TaxiNr: number
+  FamilyName: string
+  PrivatName: string
+}
+
 export class AccountNotFoundError extends Error {}
 
 export async function fetchAccount(taxiNr: number): Promise<Account> {
@@ -74,6 +80,36 @@ export async function fetchAccount(taxiNr: number): Promise<Account> {
   }
   if (!res.ok) {
     throw new Error(`Failed to load account ${taxiNr}: ${res.status}`)
+  }
+  return res.json()
+}
+
+/**
+ * Web equivalent of the txtMeterNr FindMode Enter-key branch in
+ * Account.frm — look up an account by its currently-assigned meter number.
+ * If the meter exists but isn't linked to any account (מופקד/מוסר/גנוב/...),
+ * the backend 404s with a Hebrew status message as `detail`; that message is
+ * what this throws so callers can show it directly.
+ */
+export async function fetchAccountByMeter(meterNr: number): Promise<Account> {
+  const res = await fetch(`/api/account/by-meter/${meterNr}`)
+  if (!res.ok) {
+    const body = await res.json().catch(() => null)
+    const detail = typeof body?.detail === 'string' ? body.detail : null
+    throw new AccountNotFoundError(detail || `No account for meter ${meterNr}`)
+  }
+  return res.json()
+}
+
+/**
+ * Web equivalent of the FindMode branch of txtFamilyName_KeyPress in
+ * Account.frm — prefix search on family name, for picking the right taxi
+ * when neither the taxi nor meter number is known.
+ */
+export async function searchAccountsByName(familyName: string): Promise<AccountSearchResult[]> {
+  const res = await fetch(`/api/account/search-by-name?family_name=${encodeURIComponent(familyName)}`)
+  if (!res.ok) {
+    throw new Error(`Failed to search accounts by name: ${res.status}`)
   }
   return res.json()
 }

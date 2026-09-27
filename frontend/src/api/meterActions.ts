@@ -88,3 +88,35 @@ export function replaceMeter(
 export function resetPoolBalances(taxiNr: number): Promise<{ ok: boolean }> {
   return postJson(`/api/account/${taxiNr}/meter-actions/reset-pool`, {})
 }
+
+/** Ported from cmdModem_Click -> lstModemActions_DblClick — see backend routers/meter_actions.py's modem_action(). */
+export function saveModemAction(
+  taxiNr: number,
+  action: 0 | 1,
+  branchArea: number,
+): Promise<{ ok: boolean; modem: number | null }> {
+  return postJson(`/api/account/${taxiNr}/modem-action`, { action, branch_area: branchArea })
+}
+
+/** Ported from frmChangeExp's txtReduceMonths path — see backend routers/meter_actions.py's reduce_expiry(). */
+export function reduceExpiry(
+  taxiNr: number,
+  months: number,
+  branchArea: number,
+): Promise<{ ok: boolean; expDate: number }> {
+  return postJson(`/api/account/${taxiNr}/expiry/reduce`, { months, branch_area: branchArea })
+}
+
+/** Ported from frmChangeExp's txtTransferMonths/txtTransferTaxiNr path — see backend routers/meter_actions.py's transfer_expiry(). */
+export function transferExpiry(
+  taxiNr: number,
+  months: number,
+  targetTaxiNr: number,
+  branchArea: number,
+): Promise<{ ok: boolean; sourceExpDate: number; targetTaxiNr: number; targetExpDate: number }> {
+  return postJson(`/api/account/${taxiNr}/expiry/transfer`, {
+    months,
+    target_taxi_nr: targetTaxiNr,
+    branch_area: branchArea,
+  })
+}

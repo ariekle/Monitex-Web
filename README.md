@@ -71,7 +71,7 @@ Key facts pulled directly from `Account.frm`:
   **Needs verification against the real DB** — see the open task to export `INFORMATION_SCHEMA.COLUMNS` for `Accounts`.
 
 - Save flow (`cmdSave_Click`): writes a new `History` row (status `5` = new account, `4` = update) with taxi/meter/car nr, name, area, timestamp — then updates the `Accounts` row, then conditionally syncs `carnr`/`name` onto the linked `Meters` row. Editable fields in edit mode: family/private name, station, street, home nr, town, zip, home/work/cell phone, car nr, message.
-- Button → handler map: `cmdHistory_Click` (History), `cmdInvoices_Click` (Invoices), `cmdInvoiceCopy_Click` (Copy Invoice), `cmdCheck_Click` (likely Returned Checks — not yet read in full), `cmdMeters_Click` (Meter/Cap Actions — shows an in-form popup list, `lstMeterActions`, rather than opening a separate window), `cmdModem_Click` (Modem), `cmdExpDate_Click` (Expiry), `cmdUpdate_Click` / `cmdSave_Click` / `cmdCancelEdit_Click` (Update Details edit/save/cancel), `cmdExit_Click` (Exit). `cmdConvert` ("המרה") exists but is `Visible=False` — dead button, ignore.
+- Button → handler map: `cmdHistory_Click` (History), `cmdInvoices_Click` (Invoices), `cmdInvoiceCopy_Click` (Copy Invoice), `cmdCheck_Click` (Returned Checks — `frmBackCheck.frm`, now ported, see Migration log), `cmdMeters_Click` (Meter/Cap Actions — shows an in-form popup list, `lstMeterActions`, rather than opening a separate window), `cmdModem_Click` (Modem), `cmdExpDate_Click` (Expiry), `cmdUpdate_Click` / `cmdSave_Click` / `cmdCancelEdit_Click` (Update Details edit/save/cancel), `cmdExit_Click` (Exit). `cmdConvert` ("המרה") exists but is `Visible=False` — dead button, ignore.
 
 ## Migration log
 
@@ -80,10 +80,11 @@ Key facts pulled directly from `Account.frm`:
 | `frmMain.frm`          | ❌ Not real     | Dead/unused file, not in the compiled project — disregard               |
 | `Account.frm` (internal name `frmMain`) | 🔨 In progress | `pages/Account.tsx` — the real taxi master record screen from the screenshot |
 | `frmLogin.frm`         | ⏳ Not started  | Login screen, likely precedes Account — not yet examined                 |
+| `frmBackCheck.frm`     | ✅ Ported       | `components/BadChecksModal.tsx` + `routers/bad_checks.py` — "שיקים חוזרים" (returned/bounced checks): report, search, collect repayment + interest fee, write off as lost. Schema (`BadChecks` table) reconstructed by hand, no INFORMATION_SCHEMA dump available — see `models.py`'s `BadChecks` docstring before trusting it in production. Printing (`frmBadCheckRpt`, Crystal) not ported — same as invoices, no web equivalent yet. |
 
-### Notes on the (incorrectly-attributed) `AppShell`/`TopMenu`/`StatusBar`
+### Notes on the (incorrectly-attributed) `AppShell`/`StatusBar`
 
-These were built against the dead `frmMain.frm` stub, not real app behavior. They're kept as generic app chrome for now since the real Monitex UI is a single unmenu'd window, but the menu/status-bar concept may not be the right shape once more forms (esp. `frmLogin.frm`) are examined. Revisit once the login flow and any true multi-window navigation pattern are understood.
+`AppShell`/`TopMenu`/`StatusBar` were originally built against the dead `frmMain.frm` stub, not real app behavior. `TopMenu` (a fake `Data > Account` menu, 2026-08-17) has since been removed — `App.tsx` now routes `/` straight to `pages/Account.tsx`, matching the real Monitex UI being a single unmenu'd window with no landing/menu step in front of it. `AppShell`/`StatusBar` are kept (the status-bar text is genuinely wired up via `StatusContext`, used by `Account.tsx`/`BadChecksModal.tsx` for save/error messages), but the shell's shape may still need revisiting once `frmLogin.frm` is examined.
 
 ## Stack decisions so far
 

@@ -13,6 +13,16 @@
 
 const STORAGE_KEY = 'monitex.branchArea'
 
+// Whether THIS workstation is the accounting seat — see BranchAreaGate.tsx's
+// checkbox. The original VB6 app had no separate flag for this; it just
+// overloaded Area=0 (Tel Aviv/HQ) as "this is the accounting machine" (see
+// Account.frm's F11 handler: `If Area = 0 Then frmSendtoHash.Show vbModal`).
+// Reusing Area=0 alone was judged too fragile for the web app (it's also
+// unrelated business logic elsewhere — reports, pricing, etc.), so
+// accounting capability here is gated by BOTH Area=0 AND this explicit,
+// separately-set flag (2026-09-27).
+const ACCOUNTING_STORAGE_KEY = 'monitex.isAccounting'
+
 export interface AreaOption {
   area: number
   name: string | null
@@ -37,4 +47,16 @@ export function setStoredBranchArea(area: number): void {
 
 export function clearStoredBranchArea(): void {
   window.localStorage.removeItem(STORAGE_KEY)
+}
+
+export function getStoredIsAccounting(): boolean {
+  return window.localStorage.getItem(ACCOUNTING_STORAGE_KEY) === '1'
+}
+
+export function setStoredIsAccounting(value: boolean): void {
+  if (value) {
+    window.localStorage.setItem(ACCOUNTING_STORAGE_KEY, '1')
+  } else {
+    window.localStorage.removeItem(ACCOUNTING_STORAGE_KEY)
+  }
 }

@@ -33,3 +33,16 @@ export async function fetchHistory(taxiNr: number): Promise<HistoryEntry[]> {
   }
   return res.json()
 }
+
+/**
+ * Not present in the original (frmHistory.frm only ever searches by
+ * TaxiNr) — pulls a meter's full history across every taxi it's ever been
+ * assigned to. See routers/account.py's get_history_by_meter.
+ */
+export async function fetchHistoryByMeter(meterNr: number): Promise<HistoryEntry[]> {
+  const res = await fetch(`/api/account/history/by-meter/${meterNr}`)
+  if (!res.ok) {
+    throw new Error(`Failed to load history for meter ${meterNr}: ${res.status}`)
+  }
+  return res.json()
+}

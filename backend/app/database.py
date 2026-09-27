@@ -6,10 +6,18 @@ the local Docker/Azure SQL Edge container restored from the Monitex .bak backup.
 
 Configure via a .env file (see .env.example) or real env vars:
     DB_SERVER=localhost,1433
-    DB_NAME=taxidb
+    DB_NAME=Monitex
     DB_USER=sa
     DB_PASSWORD=...
     DB_DRIVER=ODBC Driver 18 for SQL Server
+
+Note (2026-08-18): the dev container's database was renamed from "taxidb" to
+"Monitex" — several old VB6 ADODC controls / Crystal reports connect via ODBC
+DSNs that request the database by its real production name ("Monitex")
+explicitly, and renaming the actual DB was simpler than patching every DSN's
+default-database field individually. If you're restoring a fresh container
+from a .bak backup, the restored DB name will still be "taxidb" (or whatever
+the backup file names it) until renamed the same way.
 """
 import os
 from sqlalchemy import create_engine
@@ -22,7 +30,7 @@ except ImportError:
     pass
 
 DB_SERVER = os.getenv("DB_SERVER", "localhost,1433")
-DB_NAME = os.getenv("DB_NAME", "taxidb")
+DB_NAME = os.getenv("DB_NAME", "Monitex")
 DB_USER = os.getenv("DB_USER", "sa")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 DB_DRIVER = os.getenv("DB_DRIVER", "ODBC Driver 18 for SQL Server")

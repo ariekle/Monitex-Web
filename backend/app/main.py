@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .routers import account, invoices, meter_actions
+from .routers import account, bad_checks, invoices, meter_actions, reset, test_print
 
 app = FastAPI(title="Monitex API")
 
@@ -19,5 +19,8 @@ def health():
 
 
 app.include_router(account.router, prefix="/api/account")
+app.include_router(bad_checks.router)
 app.include_router(invoices.router, prefix="/api")
 app.include_router(meter_actions.router, prefix="/api/account")
+app.include_router(reset.router)
+app.include_router(test_print.router)

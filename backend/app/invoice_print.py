@@ -39,7 +39,14 @@ def _fmt_money(n: Optional[float]) -> str:
     return f"{n:,.2f}" if n is not None else ""
 
 
-def render_invoice_html(invoice: InvoiceOut) -> str:
+def render_invoice_html(invoice: InvoiceOut, copy: bool = False) -> str:
+    """
+    `copy` mirrors the print-bridge's own convention (see api/printBridge.ts /
+    routers/invoices.py's print_invoice()): True -> label "מקור" (original),
+    False -> "העתק" (copy). The caller decides this from whether the invoice
+    has ever been printed before (`not invoice.Printed`) — see print_invoice().
+    """
+    copy_label = "מקור" if copy else "העתק"
     lines_section = ""
     if invoice.Lines:
         lines_rows = "".join(
@@ -107,6 +114,7 @@ def render_invoice_html(invoice: InvoiceOut) -> str:
   h3 {{ font-size: 14px; border-bottom: 1px solid #999; padding-bottom: 4px; margin-top: 24px; }}
   .doc-header {{ display: flex; justify-content: space-between; align-items: baseline; border-bottom: 2px solid #333; padding-bottom: 8px; margin-bottom: 16px; }}
   .doc-nr {{ font-size: 16px; font-weight: bold; }}
+  .copy-label {{ font-size: 13px; font-weight: bold; color: #555; border: 1px solid #999; border-radius: 3px; padding: 2px 10px; }}
   .details {{ display: grid; grid-template-columns: 1fr 1fr; gap: 4px 24px; margin-bottom: 16px; font-size: 13px; }}
   .label {{ color: #555; }}
   table.lines {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
@@ -125,6 +133,7 @@ def render_invoice_html(invoice: InvoiceOut) -> str:
 
   <div class="doc-header">
     <h1>{_esc(invoice.TypeLabel)}</h1>
+    <div class="copy-label">{copy_label}</div>
     <div class="doc-nr">מס' {_esc(invoice.DisplayNr)}</div>
   </div>
 
